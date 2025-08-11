@@ -574,18 +574,27 @@ func (a *App) CreateSession(ctx context.Context) (*opencode.Session, error) {
 }
 
 func (a *App) SendPrompt(ctx context.Context, prompt Prompt) (*App, tea.Cmd) {
-	var cmds []tea.Cmd
-	if a.Session.ID == "" {
-		session, err := a.CreateSession(ctx)
-		if err != nil {
-			return a, toast.NewErrorToast(err.Error())
-		}
-		a.Session = session
-		cmds = append(cmds, util.CmdHandler(SessionCreatedMsg{Session: session}))
-	}
+    var cmds []tea.Cmd
+    if a.Session.ID == "" {
+        session, err := a.CreateSession(ctx)
+        if err != nil {
+            return a, toast.NewErrorToast(err.Error())
+        }
+        a.Session = session
+        cmds = append(cmds, util.CmdHandler(SessionCreatedMsg{Session: session}))
+    }
 
-	messageID := id.Ascending(id.Message)
-	message := prompt.ToMessage(messageID, a.Session.ID)
+    messageID := id.Ascending(id.Message)
+    p := prompt
+    if a.State.CompressionEnabled {
+        budget := a.State.CompressionBudget
+        if budget <= 0 {
+            budget = 3000
+        }
+        prefix := fmt.Sprintf("<!-- compress:on budget=%d -->\n", budget)
+        p.Text = prefix + p.Text
+    }
+    message := p.ToMessage(messageID, a.Session.ID)
 
 	a.Messages = append(a.Messages, message)
 

@@ -5,6 +5,9 @@
     "AGENTS.md",
     "docs/dev-standards.md"
   ],
+  "keybinds": {
+    "compression_toggle": "ctrl+shift+b"
+  },
   "agents": {
     "semantic-compress": {
       "model": "openai/gpt-4.1",

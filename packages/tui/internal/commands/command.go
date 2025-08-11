@@ -140,8 +140,9 @@ const (
 	MessagesLayoutToggleCommand CommandName = "messages_layout_toggle"
 	MessagesCopyCommand         CommandName = "messages_copy"
 	MessagesUndoCommand         CommandName = "messages_undo"
-	MessagesRedoCommand         CommandName = "messages_redo"
-	AppExitCommand              CommandName = "app_exit"
+    MessagesRedoCommand         CommandName = "messages_redo"
+    CompressionToggleCommand    CommandName = "compression_toggle"
+    AppExitCommand              CommandName = "app_exit"
 )
 
 func (k Command) Matches(msg tea.KeyPressMsg, leader bool) bool {
@@ -173,7 +174,7 @@ func parseBindings(bindings ...string) []Keybinding {
 }
 
 func LoadFromConfig(config *opencode.Config) CommandRegistry {
-	defaults := []Command{
+    defaults := []Command{
 		{
 			Name:        AppHelpCommand,
 			Description: "show help",
@@ -357,18 +358,24 @@ func LoadFromConfig(config *opencode.Config) CommandRegistry {
 			Keybindings: parseBindings("<leader>u"),
 			Trigger:     []string{"undo"},
 		},
-		{
-			Name:        MessagesRedoCommand,
-			Description: "redo message",
-			Keybindings: parseBindings("<leader>r"),
-			Trigger:     []string{"redo"},
-		},
-		{
-			Name:        AppExitCommand,
-			Description: "exit the app",
-			Keybindings: parseBindings("ctrl+c", "<leader>q"),
-			Trigger:     []string{"exit", "quit", "q"},
-		},
+        {
+            Name:        MessagesRedoCommand,
+            Description: "redo message",
+            Keybindings: parseBindings("<leader>r"),
+            Trigger:     []string{"redo"},
+        },
+        {
+            Name:        CompressionToggleCommand,
+            Description: "toggle compression",
+            Keybindings: parseBindings("ctrl+shift+b"),
+            Trigger:     []string{"compress"},
+        },
+        {
+            Name:        AppExitCommand,
+            Description: "exit the app",
+            Keybindings: parseBindings("ctrl+c", "<leader>q"),
+            Trigger:     []string{"exit", "quit", "q"},
+        },
 	}
 	registry := make(CommandRegistry)
 	keybinds := map[string]string{}

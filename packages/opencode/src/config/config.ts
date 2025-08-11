@@ -230,6 +230,11 @@ export namespace Config {
       messages_revert: z.string().optional().default("none").describe("@deprecated use messages_undo. Revert message"),
       messages_undo: z.string().optional().default("<leader>u").describe("Undo message"),
       messages_redo: z.string().optional().default("<leader>r").describe("Redo message"),
+      compression_toggle: z
+        .string()
+        .optional()
+        .default("ctrl+shift+b")
+        .describe("Toggle compression on/off"),
       app_exit: z.string().optional().default("ctrl+c,<leader>q").describe("Exit the application"),
     })
     .strict()

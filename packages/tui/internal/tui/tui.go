@@ -1218,6 +1218,18 @@ func (a Model) executeCommand(command commands.Command) (tea.Model, tea.Cmd) {
 		updated, cmd := a.messages.RedoLastMessage()
 		a.messages = updated.(chat.MessagesComponent)
 		cmds = append(cmds, cmd)
+	case commands.CompressionToggleCommand:
+		a.app.State.CompressionEnabled = !a.app.State.CompressionEnabled
+		msg := "Compression disabled"
+		if a.app.State.CompressionEnabled {
+			b := a.app.State.CompressionBudget
+			if b <= 0 {
+				b = 3000
+			}
+			msg = fmt.Sprintf("Compression enabled (budget %d)", b)
+		}
+		cmds = append(cmds, a.app.SaveState())
+		cmds = append(cmds, toast.NewInfoToast(msg, toast.WithTitle("Compression")))
 	case commands.AppExitCommand:
 		return a, tea.Quit
 	}
