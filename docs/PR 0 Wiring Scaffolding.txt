@@ -1,0 +1,566 @@
+
+# PR 0 — Wiring & Scaffolding
+
+## Goal
+
+Create a clean monorepo scaffold with:
+
+* OpenCode config + stable instruction prefix (for prompt caching later)
+* Agent + plugin stubs
+* Packages for **repo-index** (Tree-sitter work lives here later) and **repo-mcp** (MCP server wrapper)
+* Minimal tests so CI has a heartbeat and we can iterate safely
+
+---
+
+## Files & Folders to Add
+
+```
+.opencode/
+  opencode.json
+  agent/
+    semantic-compress.md
+  plugin/
+    context-pack.ts
+
+AGENTS.md
+docs/
+  dev-standards.md
+
+packages/
+  repo-index/
+    package.json
+    tsconfig.json
+    src/
+      index.ts
+      types.ts
+      watcher.ts
+    bin/
+      repo-index.ts
+
+  repo-mcp/
+    package.json
+    tsconfig.json
+    src/
+      server.ts
+      tools.ts
+    bin/
+      repo-mcp.ts
+
+packages/shared/
+  package.json
+  tsconfig.json
+  src/
+    types.ts
+
+fixtures/
+  README.md
+
+tests/
+  prefix-hash.test.ts
+  mcp-smoke.test.ts
+
+package.json
+tsconfig.base.json
+bunfig.toml
+```
+
+---
+
+## Root config
+
+### `package.json` (root)
+
+```json
+{
+  "name": "opencode-semantic-compression",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:repo-mcp": "bun run --cwd packages/repo-mcp bin/repo-mcp.ts",
+    "build": "bun run --cwd packages/repo-index build && bun run --cwd packages/repo-mcp build",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  },
+  "engines": {
+    "node": ">=20",
+    "bun": ">=1.1.0"
+  }
+}
+```
+
+### `tsconfig.base.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "declaration": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "outDir": "dist",
+    "types": ["vitest/globals"]
+  }
+}
+```
+
+### `bunfig.toml`
+
+```toml
+[install]
+# Keep lockfile deterministic across agents/OS
+saveTextLockfile = true
+```
+
+---
+
+## OpenCode wiring
+
+### `.opencode/opencode.json`
+
+> Minimal, OpenAI-first. The `mcp` entry launches our local MCP server stub.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "openai/gpt-4.1",
+  "instructions": [
+    "AGENTS.md",
+    "docs/dev-standards.md"
+  ],
+  "agents": {
+    "semantic-compress": {
+      "model": "openai/gpt-4.1",
+      "prompt": "{file:.opencode/agent/semantic-compress.md}"
+    }
+  },
+  "mcp": {
+    "repo-graph": {
+      "type": "local",
+      "command": ["bun", "run", "dev:repo-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+### `.opencode/agent/semantic-compress.md`
+
+> Empty-ish for now; it just confirms the contract we’ll fill in later.
+
+```md
+# Agent: semantic-compress (PR 0 scaffold)
+
+You are a code agent working with a repository-aware MCP server.
+- Before editing, verify MCP tools are available.
+- For now (PR 0), do nothing but acknowledge tools.
+- Later PRs will define: context pack selection, readSpan expansions, and decision logging.
+```
+
+### `.opencode/plugin/context-pack.ts`
+
+> Stub plugin—later we’ll use this to gently steer the model away from whole-file reads.
+
+```ts
+// PR 0 stub. Later: intercept outgoing context payloads and log policy nudges.
+export function onPreSendPrompt(_prompt: string) {
+  // no-op
+}
+```
+
+---
+
+## Stable instruction prefix
+
+### `AGENTS.md`
+
+> Stable rules we’ll keep at the top of every prompt (helps OpenAI prompt caching later).
+
+```md
+# Project Agent Rules (Stable)
+- Follow repo coding standards in docs/dev-standards.md.
+- Prefer minimal diffs and clear commit messages.
+- Never include secrets or `.env` contents in prompts.
+- When unsure, ask for the smallest additional span of code needed.
+```
+
+### `docs/dev-standards.md`
+
+```md
+# Dev Standards
+- Language: TypeScript for internal tooling; Node 20+ / Bun 1.1+.
+- Tests: Vitest. Keep unit tests fast (< 2s).
+- Style: Prettier defaults; no exotic TS features unless necessary.
+- Commits: Conventional style (feat:, fix:, chore:, test:, refactor:).
+```
+
+---
+
+## Packages
+
+### `packages/shared/package.json`
+
+```json
+{
+  "name": "@opencode/shared",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  }
+}
+```
+
+### `packages/shared/tsconfig.json`
+
+```json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "include": ["src"]
+}
+```
+
+### `packages/shared/src/types.ts`
+
+```ts
+export type FilePath = string;
+
+export interface ContextPack {
+  full: Array<{ path: FilePath; ranges?: [number, number][] }>;
+  skeletons: Array<{ path: FilePath; hash?: string }>;
+  interfaces: Array<{ path: FilePath }>;
+  search_hits: Array<{ path: FilePath; line: number; text: string }>;
+  notes?: string;
+  budget?: { target: number; used?: number };
+}
+```
+
+---
+
+### `packages/repo-index/package.json`
+
+```json
+{
+  "name": "@opencode/repo-index",
+  "version": "0.0.0",
+  "type": "module",
+  "bin": {
+    "repo-index": "./bin/repo-index.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  }
+}
+```
+
+### `packages/repo-index/tsconfig.json`
+
+```json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src", "bin"]
+}
+```
+
+### `packages/repo-index/src/types.ts`
+
+```ts
+import type { FilePath } from "@opencode/shared/src/types";
+
+export interface SymbolInfo {
+  file: FilePath;
+  name: string;
+  kind: "func" | "class" | "const" | "type" | "var" | "module";
+  startLine: number;
+  endLine: number;
+  doc?: string;
+}
+
+export interface Edge {
+  from: string; // symbol name (scoped)
+  to: string;   // symbol name (scoped)
+  type: "calls" | "imports" | "exports";
+}
+
+export interface RepoIndex {
+  files: FilePath[];
+  symbols: SymbolInfo[];
+  edges: Edge[];
+  updatedAt: number;
+}
+```
+
+### `packages/repo-index/src/index.ts`
+
+```ts
+import type { RepoIndex } from "./types";
+
+let CURRENT_INDEX: RepoIndex = { files: [], symbols: [], edges: [], updatedAt: Date.now() };
+
+export async function buildIndex(root: string): Promise<RepoIndex> {
+  // PR 0 stub: later PR will populate using Tree-sitter and a watcher.
+  CURRENT_INDEX = { files: [], symbols: [], edges: [], updatedAt: Date.now() };
+  return CURRENT_INDEX;
+}
+
+export async function updateIndex(_changedPaths: string[]): Promise<RepoIndex> {
+  // PR 0 stub
+  CURRENT_INDEX.updatedAt = Date.now();
+  return CURRENT_INDEX;
+}
+
+export function getIndex(): RepoIndex {
+  return CURRENT_INDEX;
+}
+```
+
+### `packages/repo-index/src/watcher.ts`
+
+```ts
+// PR 1 will implement a file watcher that triggers updateIndex on change.
+export function startWatcher(_root: string) {
+  // no-op in PR 0
+}
+```
+
+### `packages/repo-index/bin/repo-index.ts`
+
+```ts
+#!/usr/bin/env bun
+import { buildIndex, getIndex } from "../src/index";
+
+const root = process.argv[2] ?? process.cwd();
+await buildIndex(root);
+console.log(JSON.stringify({ ok: true, indexUpdatedAt: getIndex().updatedAt }));
+```
+
+---
+
+### `packages/repo-mcp/package.json`
+
+```json
+{
+  "name": "@opencode/repo-mcp",
+  "version": "0.0.0",
+  "type": "module",
+  "bin": {
+    "repo-mcp": "./bin/repo-mcp.ts"
+  },
+  "dependencies": {
+    "@opencode/repo-index": "0.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "bun ./bin/repo-mcp.ts"
+  }
+}
+```
+
+### `packages/repo-mcp/tsconfig.json`
+
+```json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "include": ["src", "bin"]
+}
+```
+
+### `packages/repo-mcp/src/tools.ts`
+
+```ts
+import { buildIndex, getIndex } from "@opencode/repo-index/src/index";
+
+export async function handleGraphBuild(params: { root?: string }) {
+  const root = params.root ?? process.cwd();
+  await buildIndex(root);
+  return { ok: true, updatedAt: getIndex().updatedAt };
+}
+
+// PR 4 will add workingSet.select, code.readSpan, etc.
+```
+
+### `packages/repo-mcp/src/server.ts`
+
+```ts
+// Minimal MCP-ish stdio loop (PR 0). Later PRs will speak real MCP JSON-RPC 2.0.
+import { handleGraphBuild } from "./tools";
+
+// A trivial, line-delimited protocol for smoke tests (not real MCP yet).
+// Request: {"method":"repo.graphBuild","params":{"root":"..."}}
+export async function startServer() {
+  const rl = require("readline").createInterface({ input: process.stdin, output: process.stdout });
+  console.log("MCP:READY"); // test looks for this
+  rl.on("line", async (line: string) => {
+    try {
+      const msg = JSON.parse(line);
+      if (msg?.method === "repo.graphBuild") {
+        const res = await handleGraphBuild(msg.params ?? {});
+        process.stdout.write(JSON.stringify({ id: msg.id ?? null, result: res }) + "\n");
+      } else {
+        process.stdout.write(JSON.stringify({ id: msg.id ?? null, error: "unknown_method" }) + "\n");
+      }
+    } catch (e) {
+      process.stdout.write(JSON.stringify({ error: "bad_json", detail: String(e) }) + "\n");
+    }
+  });
+}
+```
+
+### `packages/repo-mcp/bin/repo-mcp.ts`
+
+```ts
+#!/usr/bin/env bun
+import { startServer } from "../src/server";
+startServer();
+```
+
+---
+
+## Fixtures & Tests
+
+### `fixtures/README.md`
+
+```md
+This directory will hold small repos for tests in later PRs (py-mini, ts-mini, etc.).
+For PR 0, it stays empty.
+```
+
+### `tests/prefix-hash.test.ts`
+
+> Ensures our *stable* instruction prefix doesn’t accidentally change between runs.
+
+```ts
+import { describe, it, expect } from "vitest";
+import { createHash } from "crypto";
+import { readFileSync } from "fs";
+
+function stableHash() {
+  const a = readFileSync("AGENTS.md", "utf-8");
+  const b = readFileSync("docs/dev-standards.md", "utf-8");
+  return createHash("sha256").update(a + "\n---\n" + b).digest("hex");
+}
+
+describe("stable instruction prefix", () => {
+  it("produces a deterministic hash", () => {
+    const h1 = stableHash();
+    const h2 = stableHash();
+    expect(h1).toBe(h2);
+  });
+});
+```
+
+### `tests/mcp-smoke.test.ts`
+
+> Launches the MCP stub and checks for readiness + a basic request/response.
+
+```ts
+import { describe, it, expect } from "vitest";
+import { spawn } from "child_process";
+
+function send(proc: any, obj: any) {
+  proc.stdin.write(JSON.stringify(obj) + "\n");
+}
+
+function recv(proc: any): Promise<any> {
+  return new Promise((resolve) => {
+    proc.stdout.once("data", (buf: Buffer) => resolve(buf.toString().trim()));
+  });
+}
+
+describe("repo-mcp smoke", () => {
+  it("starts and handles repo.graphBuild", async () => {
+    const proc = spawn("bun", ["run", "dev:repo-mcp"], { stdio: ["pipe", "pipe", "pipe"] });
+
+    const ready = await recv(proc);
+    expect(ready).toContain("MCP:READY");
+
+    send(proc, { id: 1, method: "repo.graphBuild", params: { root: process.cwd() } });
+    const resLine = await recv(proc);
+    const res = JSON.parse(resLine);
+    expect(res.id).toBe(1);
+    expect(res.result?.ok).toBe(true);
+
+    proc.kill();
+  });
+});
+```
+
+---
+
+## How to run locally (for your agent / CI)
+
+1. **Install**
+
+   * Install Bun ≥ 1.1 and Node ≥ 20.
+   * `bun install`
+
+2. **Build**
+
+   * `bun run build`
+
+3. **Run tests**
+
+   * `bun run test`
+
+4. **Smoke the MCP stub manually (optional)**
+
+   * `bun run dev:repo-mcp`
+   * In another shell:
+     `echo '{"id":1,"method":"repo.graphBuild","params":{"root":"."}}' | nc localhost 0` *(or just type JSON then Enter if you’re piping stdin manually)*
+
+---
+
+## PR Description (ready to paste)
+
+**Title:** PR 0 — Scaffolding: OpenCode config, agent/plugin stubs, MCP + index packages, tests
+
+**Summary:**
+Sets up a clean monorepo scaffold for semantic compression. Adds OpenCode config with a stable instruction prefix, a minimal `semantic-compress` agent, plugin stub, and two packages: `repo-index` (Tree-sitter indexer to be implemented in PR 1–3) and `repo-mcp` (local MCP server wrapper). Includes two tests: stable prefix hash and MCP smoke.
+
+**Changes:**
+
+* `.opencode/opencode.json` → OpenAI model + MCP hook
+* `.opencode/agent/semantic-compress.md` → agent stub
+* `.opencode/plugin/context-pack.ts` → plugin stub
+* `AGENTS.md`, `docs/dev-standards.md` → stable prompt header
+* `packages/repo-index` & `packages/repo-mcp` → scaffolds + bins
+* `packages/shared` → shared types
+* `tests/` → prefix hash + MCP smoke tests
+* root configs: workspaces, TS, Bun, Vitest
+
+**Acceptance Criteria:**
+
+* `bun install && bun run build` succeeds
+* `bun run test` passes (both tests green)
+* `bun run dev:repo-mcp` prints `MCP:READY` and responds to a `repo.graphBuild` request
+
+**Notes:**
+Real MCP JSON-RPC + Tree-sitter, skeletonizer, and Context Pack logic land in subsequent PRs.
+
+---
+
+If you want, I can follow up with **PR 1** (Tree-sitter indexer plan + exact files) next.
+

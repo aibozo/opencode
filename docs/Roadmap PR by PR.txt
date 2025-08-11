@@ -1,0 +1,297 @@
+# Roadmap (PR-by-PR)
+
+## PR 0 — Wiring & scaffolding (baseline)
+
+**Scope**
+
+* Add project config and empty stubs so later PRs drop in cleanly.
+
+**Tasks**
+
+* `.opencode/opencode.json` → set OpenAI model, add stable `instructions` sources (`AGENTS.md`, `docs/dev-standards.md`).
+* Create `.opencode/agent/semantic-compress.md` (empty for now).
+* Create package `packages/repo-index` (TS) and `packages/repo-mcp` (TS) stubs.
+* Add `scripts/dev:repo-mcp` to run the local MCP server.
+
+**Tests (must pass)**
+
+* CI boots, `opencode dev` runs; agent loads with no tools enabled yet.
+* Snapshot test: stable prompt header hash stays constant across 2 turns.
+
+**DoD**
+
+* You can start a chat with the placeholder agent; nothing crashes.
+
+---
+
+## PR 1 — Tree-sitter indexer (automatic, incremental)
+
+**Scope**
+
+* Parse repo → build symbol table, import graph, and call graph.
+* Languages v1: **Python**, **TS/JS**. (Go can be PR 8+.)
+
+**Tasks**
+
+* Use Tree-sitter parsers (`tree-sitter-python`, `tree-sitter-javascript`, `tree-sitter-typescript`).
+* Walk ASTs to extract:
+
+  * Files, module imports/exports
+  * Top-level classes/functions/consts (name, start/end lines, docstring if present)
+  * Intra-file call edges (best-effort: identifier refs inside function bodies)
+* Build a tiny SQLite/JSONL index: `files`, `symbols`, `edges`.
+* File-watcher: on save/change, re-index only touched files.
+* Expose a pure lib API: `buildIndex(root)`, `updateIndex(changedPaths)`, `getNeighbors(symbol, radius)`.
+
+**Tests**
+
+* Unit: AST extraction on fixtures; symbol ranges match ground truth.
+* Snapshot: index JSON for a small fixture repo matches expected.
+* Perf: index 1k files < N seconds (set a sane N, e.g., 5s on local).
+
+**DoD**
+
+* Running `node packages/repo-index/bin/build` produces a stable index and keeps it fresh on file changes.
+
+---
+
+## PR 2 — Skeletonizer (lossless interface view)
+
+**Scope**
+
+* Generate **skeletal** code views: signatures, docstrings, imports, constants, with **elided bodies** including line ranges + stable content hash.
+
+**Tasks**
+
+* Add `skeletonize(path)` using Tree-sitter nodes; keep:
+
+  * file header/comments
+  * imports
+  * class/func signatures
+  * docstrings
+  * const/enum/type aliases
+* Replace bodies with markers:
+
+  ```
+  def foo(x, y):  # L120–190  ⟪BODY ELIDED; 23 lines; sha1=ab12…⟫
+  ```
+* Ensure line numbers are exact and survive edits (trust fresh parse each time).
+
+**Tests**
+
+* Snapshot: skeleton output for fixtures (py + ts) is stable.
+* Round-trip safety: public API signatures in skeleton == in full source.
+* Hash test: changing a body changes the elision hash.
+
+**DoD**
+
+* `skeletonize` returns compact, accurate views for any indexed file.
+
+---
+
+## PR 3 — Working-set selector (budgeted context packs)
+
+**Scope**
+
+* Given a task (failure trace, filenames, or free-text), produce a **Context Pack** under a token budget.
+
+**Tasks**
+
+* Implement `selectWorkingSet({ task, budget, radius })`:
+
+  * **Locus**: parse stack traces / explicit file hints / grep hits.
+  * **Core**: full text for direct targets + failing tests.
+  * **Frontier**: 1-hop neighbors (callers/callees/importers) as **skeletons**; auto-bump to 2 hops when types/interfaces appear.
+  * **Scoring**: simple weighted rank: `BM25-ish (rg counts)` + `graph proximity (1/r)`; embeddings optional (toggle-able later).
+* Return schema:
+
+  ```json
+  {
+    "full":[{"path":"src/x.py","ranges":[[60,160]]}, {"path":"tests/test_x.py"}],
+    "skeletons":[{"path":"src/bar.ts","hash":"..."}],
+    "interfaces":[{"path":"src/types.ts"}],
+    "search_hits":[{"path":"...","line":87,"text":"..."}],
+    "notes":"compressed NL summary (<=1.5k tokens)",
+    "budget":{"target":64000,"used":...}
+  }
+  ```
+
+**Tests**
+
+* Determinism: same repo + task → same pack (within order tolerance).
+* Coverage: for a seeded bug, the pack includes all edited files or their neighbors.
+* Budget: token estimator keeps `used <= target`.
+
+**DoD**
+
+* `selectWorkingSet` reliably returns high-recall packs within budget.
+
+---
+
+## PR 4 — MCP server (tooling layer)
+
+**Scope**
+
+* Wrap index/selector/skeletonizer behind MCP tools OpenCode can call.
+
+**Tools**
+
+* `repo.graphBuild()` (idempotent; background index refresh)
+* `repo.workingSet.select({ task, budget })` → Context Pack
+* `repo.code.readSpan(path, start, end)` (on-demand body)
+* `repo.code.search(pattern, globs)`
+* `repo.code.skeleton(path)`
+* `repo.git.applyPatch(diff)` (thin wrapper around built-in patch tool if you like)
+
+**Tests**
+
+* Contract tests per tool (JSON schema validation).
+* Concurrency: multiple `readSpan` calls while indexer runs.
+* Large file safety: `readSpan` clamps to sane sizes.
+
+**DoD**
+
+* `opencode dev` shows the MCP tools; quick manual call returns a real pack.
+
+---
+
+## PR 5 — Agent + prompt assembly (stable prefix + habits)
+
+**Scope**
+
+* Teach the agent to always pull a Context Pack and expand **only** as needed; also maximize OpenAI prompt caching.
+
+**Tasks**
+
+* Fill `.opencode/agent/semantic-compress.md` with behavior:
+
+  * On new task: call `repo.graphBuild` (fast no-op if warm), then `repo.workingSet.select`.
+  * Include **tests + traces fully**; use skeletons for neighbors.
+  * Ask for **`readSpan`** when unsure; avoid whole-file reads.
+  * Keep a short **decision log** + TODOs per step (temporal coherence).
+* Prompt assembly:
+
+  * **Stable prefix**: AGENTS.md + tool manifest + repo map summary (hash to confirm stability).
+  * **Variable tail**: current Context Pack + diffs/decisions.
+* Add `.opencode/plugin/context-pack.ts`:
+
+  * Log when the model asks for whole files; gently nudge to spans.
+  * Optional: block `.env`/secrets from being sent.
+
+**Tests**
+
+* Unit: stable prefix hash unchanged between turns (when config untouched).
+* Policy: simulated request for a missing body triggers `readSpan`.
+* Plugin: denies whole-file read when span would do (toggle-able).
+
+**DoD**
+
+* End-to-end run: agent fetches a pack, edits a file, and requests spans as needed.
+
+---
+
+## PR 6 — NL extractive compression (issues, logs, traces)
+
+**Scope**
+
+* Compress natural-language chunks **without paraphrasing** (faithful extraction).
+
+**Tasks**
+
+* Implement a tiny extractor (TextRank or position-aware scoring) with token budget target.
+* CLI: `nl.compress(text, budgetTokens)` used by `selectWorkingSet` to produce `notes`.
+
+**Tests**
+
+* Faithfulness: selected sentences are verbatim substrings.
+* Budget: <= configured tokens with variance ≤5%.
+* Utility: accuracy on fixture tasks improves vs. no compression (pack stays under budget; recall unchanged).
+
+**DoD**
+
+* Any long issue/trace/log shrinks 2–5× while remaining faithful.
+
+---
+
+## PR 7 — “Don’t drop anything” guard + metrics
+
+**Scope**
+
+* Add measurable guarantees and a tiny eval harness.
+
+**Tasks**
+
+* **Line-recall metric**: After a session, verify every edited line appeared either in:
+
+  * initial **full** context, **or**
+  * a `readSpan` tool result.
+* Token accounting: record per-turn prompt tokens (pre-send).
+* Tiny harness: run seeded bugfix tasks on 2–3 fixture repos; output:
+
+  * recall %, #expansions, budget adherence, test pass/fail.
+* Store session state (`.opencode/state/`) with decision log + pack hashes.
+
+**Tests**
+
+* Failing recall triggers an automatic “expand frontier” retry.
+* Reports persist as JSON + pretty table.
+
+**DoD**
+
+* You can point it at fixtures and see metrics with recalls at \~100%.
+
+---
+
+## PR 8 — Extra language + robustness (optional)
+
+**Scope**
+
+* Add **Go** or deepen Python/TS resolution (e.g., alias resolution, re-exports).
+* Add fallback when parsing fails (send minimal context + ask for spans).
+
+**Tests**
+
+* Same as PR 1–3 for the new language; plus mixed-language repo fixture.
+
+**DoD**
+
+* Multi-language repos behave well; failures degrade gracefully.
+
+---
+
+# Test Fixtures (to include in `fixtures/`)
+
+* **py-mini**: 8–10 files, 2 modules, 1 test failure seeded.
+* **ts-mini**: same idea, with a type alias neighbor required to fix.
+* **mixed-mini**: small py + ts interop via HTTP/CLI boundary.
+* Long **issue.md** with stack trace and NL (for PR 6).
+
+Each fixture includes:
+
+* `task.md` (what the agent will be asked)
+* `expected_patch.diff`
+* `run-tests.sh` for a green final state
+
+---
+
+# Acceptance checklist per stage
+
+* **Index**: parses, updates incrementally, produces deterministic symbols/edges.
+* **Skeletons**: stable, signature-faithful, precise line ranges + hashes.
+* **Working set**: includes core + neighbors, stays under budget.
+* **Agent behavior**: always starts from a Context Pack, expands with `readSpan`.
+* **Safety**: line-recall 100% or auto-expand → retry.
+* **Caching**: stable prefix hash unchanged across turns unless config changes.
+
+---
+
+# Notes on “automatic, not forgettable”
+
+* The **indexer runs in the background** as soon as the MCP server starts; `graphBuild` becomes a cheap “ensure-warm” call the agent does by habit, but even if it forgets, the watcher will have kept the index warm.
+* `selectWorkingSet` internally calls `skeletonize` as needed; the agent never has to remember it.
+* The plugin can intercept any “send full file” event and suggest a `readSpan` call with the exact ranges the model referenced.
+
+---
+
+If this split looks good, say the word and I’ll draft the initial folder structure and the agent + config for **PR 0**. Want the indexer in **TypeScript** (fast to iterate with Bun) or **Go** (single static binary)?
+

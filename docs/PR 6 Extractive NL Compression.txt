@@ -1,0 +1,479 @@
+
+# PR 6 — Extractive NL Compression + Real Token Counting
+
+## Objectives
+
+* Add a **faithful, extractive** compressor for issues/logs/traces: shrink 2–5× with **zero paraphrase**.
+* Provide a **real tokenizer** (tiktoken) with a safe **heuristic fallback**.
+* Use the compressor inside **`selectWorkingSet`** to produce tighter `pack.notes`.
+* (Optional) Expose `repo.nl.compress` as an MCP tool for ad-hoc use.
+
+---
+
+## Changes at a glance
+
+* New package: `@opencode/nl-compress` with segmenter, scorer, MMR selector, and budget packer.
+* Upgrade `tokenize.ts` to support **tiktoken** when present.
+* Update `working-set.ts` to call `compressNotes(...)` instead of the stub.
+* Extend MCP with a new tool: `repo.nl.compress(text, budgetTokens)` (optional but nice).
+* Tests: faithfulness, determinism, budget adherence, edge cases.
+
+---
+
+## New / Updated Files
+
+### 0) Tokenizer upgrade
+
+**`packages/repo-index/package.json` (add optional dep)**
+
+```json
+{
+  "optionalDependencies": {
+    "@dqbd/tiktoken": "^1.0.15"
+  }
+}
+```
+
+**`packages/repo-index/src/tokenize.ts` (replace with pluggable tokenizer)**
+
+```ts
+export interface Tokenizer {
+  estimateTokens(text: string): number;
+}
+
+let _bpe: any | null = null;
+
+export async function createTokenizer(): Promise<Tokenizer> {
+  if (_bpe) return _bpe;
+
+  try {
+    // Lazy init tiktoken (optional)
+    const { encoding_for_model } = await import("@dqbd/tiktoken");
+    const enc = encoding_for_model("gpt-4o"); // close enough; model here is OpenAI-first
+    _bpe = {
+      estimateTokens(text: string) {
+        try { return enc.encode(text).length; }
+        catch { return heuristicEstimate(text); }
+      }
+    };
+    return _bpe;
+  } catch {
+    // Fallback heuristic
+    _bpe = { estimateTokens: heuristicEstimate };
+    return _bpe;
+  }
+}
+
+function heuristicEstimate(text: string): number {
+  const punct = (text.match(/[{}()[\].,;:+\-*/=<>]/g) ?? []).length;
+  const base = Math.ceil(text.length / 4);
+  return base + Math.ceil(punct / 3);
+}
+```
+
+> Note: We keep the exported `Tokenizer` type and add `createTokenizer()` so both `working-set` and `nl-compress` use the same counter.
+
+---
+
+### 1) New package: `@opencode/nl-compress`
+
+**`packages/nl-compress/package.json`**
+
+```json
+{
+  "name": "@opencode/nl-compress",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "dependencies": {},
+  "devDependencies": { "typescript": "^5.5.4" }
+}
+```
+
+**`packages/nl-compress/tsconfig.json`**
+
+```json
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "rootDir": "src", "outDir": "dist" }, "include": ["src"] }
+```
+
+**`packages/nl-compress/src/segment.ts`**
+
+````ts
+// Sentence-ish segmentation that preserves code/stack blocks as atomic units.
+export interface Segment { text: string; start: number; end: number; kind: "line"|"code"|"stack"|"para"; }
+
+export function segment(text: string): Segment[] {
+  const lines = text.split(/\r?\n/);
+
+  // Mark fenced code blocks
+  const segs: Segment[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    // fenced code ```...```
+    if (/^\s*```/.test(lines[i])) {
+      const start = i;
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) i++;
+      const end = Math.min(i, lines.length - 1);
+      segs.push({ text: lines.slice(start, end + 1).join("\n"), start, end, kind: "code" });
+      i++; continue;
+    }
+    // stack trace-ish lines cluster
+    if (/(^Traceback|^\s*at\s|File ".*", line \d+)/.test(lines[i])) {
+      const start = i;
+      let end = i;
+      while (end + 1 < lines.length && /(^\s+at\s|^\s*File ".*", line \d+|^\s+.*Error|^\s*Traceback|^\s*Caused by:)/.test(lines[end + 1])) end++;
+      segs.push({ text: lines.slice(start, end + 1).join("\n"), start, end, kind: "stack" });
+      i = end + 1; continue;
+    }
+    // paragraph chunk
+    const start = i;
+    while (i + 1 < lines.length && lines[i + 1].trim() !== "") i++;
+    const end = i;
+    const block = lines.slice(start, end + 1).join("\n").trim();
+    if (block) segs.push({ text: block, start, end, kind: "para" });
+    i++;
+    // skip blank
+    while (i < lines.length && lines[i].trim() === "") i++;
+  }
+  return segs;
+}
+````
+
+**`packages/nl-compress/src/score.ts`**
+
+```ts
+import type { Segment } from "./segment";
+
+export interface ScoreOpts { keywords?: string[]; }
+
+export function scoreSegments(segs: Segment[], opts: ScoreOpts = {}): number[] {
+  const scores: number[] = [];
+  const kws = new Set((opts.keywords ?? []).map(k => k.toLowerCase()));
+
+  const total = segs.length || 1;
+  segs.forEach((s, idx) => {
+    let sc = 0;
+
+    // type prior
+    if (s.kind === "stack") sc += 6;
+    if (s.kind === "code") sc += 3;
+    if (s.kind === "para") sc += 2;
+
+    // position (earlier gets small boost)
+    sc += (total - idx) / total; // 0..1
+
+    // keyword hits
+    const lower = s.text.toLowerCase();
+    let hits = 0;
+    kws.forEach(k => { if (lower.includes(k)) hits++; });
+    sc += Math.min(4, hits); // cap
+
+    // error words
+    if (/(error|exception|assert|fail|expected|received)/i.test(s.text)) sc += 2;
+
+    scores.push(sc);
+  });
+  return scores;
+}
+```
+
+**`packages/nl-compress/src/mmr.ts`**
+
+```ts
+// Maximal Marginal Relevance over bag-of-words Jaccard similarity
+import type { Segment } from "./segment";
+
+function tokenSet(s: string): Set<string> {
+  return new Set((s.toLowerCase().match(/[a-z0-9_]+/g) ?? []).filter(w => w.length > 2));
+}
+function jaccard(a: Set<string>, b: Set<string>) {
+  const inter = new Set([...a].filter(x => b.has(x)));
+  const uni = new Set([...a, ...b]);
+  return inter.size / Math.max(1, uni.size);
+}
+
+export function selectMMR(segs: Segment[], scores: number[], lambda = 0.8, limit?: number): number[] {
+  const idxs = segs.map((_, i) => i).sort((a, b) => scores[b] - scores[a]);
+  const chosen: number[] = [];
+  const sets = segs.map(s => tokenSet(s.text));
+  while (idxs.length) {
+    let best = idxs[0], bestVal = -Infinity;
+    for (const i of idxs) {
+      const sim = chosen.length ? Math.max(...chosen.map(j => jaccard(sets[i], sets[j]))) : 0;
+      const val = lambda * scores[i] - (1 - lambda) * sim;
+      if (val > bestVal) { bestVal = val; best = i; }
+    }
+    chosen.push(best);
+    idxs.splice(idxs.indexOf(best), 1);
+    if (limit && chosen.length >= limit) break;
+  }
+  // preserve original order when emitting
+  return chosen.sort((a, b) => segs[a].start - segs[b].start);
+}
+```
+
+**`packages/nl-compress/src/index.ts`**
+
+```ts
+import { segment } from "./segment";
+import { scoreSegments } from "./score";
+import { selectMMR } from "./mmr";
+import type { Segment } from "./segment";
+import { createTokenizer } from "@opencode/repo-index/src/tokenize";
+
+export interface CompressOpts {
+  budgetTokens: number;
+  keywords?: string[];
+  keepAtLeast?: number;      // default 3 segments
+  lambda?: number;           // MMR tradeoff (0..1), default 0.8
+}
+
+export async function compress(text: string, opts: CompressOpts): Promise<string> {
+  const tok = await createTokenizer();
+  const segs = segment(text);
+  if (!segs.length) return "";
+
+  // Score + select
+  const scores = scoreSegments(segs, { keywords: opts.keywords });
+  const order = selectMMR(segs, scores, opts.lambda ?? 0.8);
+
+  // Pack until budget, preserving original order; always include at least N segments
+  const keepMin = Math.max(1, opts.keepAtLeast ?? 3);
+  const out: string[] = [];
+  let used = 0; let kept = 0;
+  for (const i of order) {
+    const s = segs[i];
+    const add = s.text;
+    const cost = tok.estimateTokens(add);
+    if (kept < keepMin || used + cost <= opts.budgetTokens) {
+      out.push(add);
+      used += cost; kept++;
+    } else {
+      break;
+    }
+  }
+
+  // Faithful extractive: join with blank lines, no paraphrase
+  return out.join("\n\n");
+}
+```
+
+---
+
+### 2) Integrate in working-set
+
+**`packages/repo-index/src/working-set.ts` (replace notes block)**
+
+```ts
+import { compress } from "@opencode/nl-compress/src/index";
+import { createTokenizer } from "./tokenize";
+// ...
+  // Always include NOTES — now compressed extractively
+  const tok = await createTokenizer();
+  const raw = opts.task.split(/\r?\n/).slice(0, 2000).join("\n"); // cap input size
+  const notesBudget = Math.max(200, Math.floor((budget * 0.05))); // up to 5% of total tokens
+  const kw = keywordsFromTask(opts.task);
+  const brief = await compress(raw, { budgetTokens: notesBudget, keywords: kw, keepAtLeast: 3 });
+  pack.notes = brief;
+  used += tok.estimateTokens(brief);
+```
+
+*(Remove the old naive “top 30 lines” code.)*
+
+---
+
+### 3) Optional MCP tool
+
+**`packages/repo-mcp/src/schemas.ts` (add)**
+
+```ts
+export const ZCompressArgs = z.object({
+  text: z.string().min(1),
+  budgetTokens: z.number().int().positive(),
+  keywords: z.array(z.string()).optional()
+});
+export type CompressArgs = z.infer<typeof ZCompressArgs>;
+```
+
+**`packages/repo-mcp/src/server.ts` (add tool registration + router case)**
+
+```ts
+import { ZCompressArgs } from "./schemas";
+import { compress as nlCompress } from "@opencode/nl-compress/src/index";
+// ...
+  const tools: Tool[] = [
+    // ...existing...
+    {
+      name: "repo.nl.compress",
+      description: "Extractively compress NL text to a token budget (faithful).",
+      inputSchema: ZCompressArgs.toJSON() as any
+    }
+  ];
+// ...
+    case "repo.nl.compress": {
+      const p = ZCompressArgs.parse(args ?? {});
+      const out = await nlCompress(p.text, { budgetTokens: p.budgetTokens, keywords: p.keywords });
+      return { text: out };
+    }
+```
+
+---
+
+## Tests
+
+**Add to root workspaces:** `"packages/nl-compress"`
+
+### `packages/nl-compress/__tests__/compress-faithful.test.ts`
+
+````ts
+import { describe, it, expect } from "vitest";
+import { compress } from "../src/index";
+
+const SAMPLE = `
+Error: Something blew up
+    at src/mathy.ts:10:3
+
+Details:
+We expected 4, received 5.
+
+\`\`\`diff
+- return a + b;
++ return a + b - 1;
+\`\`\`
+`;
+
+describe("faithful extractive compression", async () => {
+  it("returns only substrings of input and keeps code blocks whole", async () => {
+    const out = await compress(SAMPLE, { budgetTokens: 40, keywords: ["expected","received"] });
+    // every non-empty line in out must occur in input
+    for (const line of out.split(/\r?\n/).filter(l => l.trim())) {
+      expect(SAMPLE).toContain(line);
+    }
+    // fenced block preserved
+    if (out.includes("```")) {
+      expect(out).toContain("```diff");
+      expect(out).toContain("+ return a + b - 1;");
+    }
+  });
+});
+````
+
+### `packages/nl-compress/__tests__/compress-budget.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { compress } from "../src/index";
+import { createTokenizer } from "@opencode/repo-index/src/tokenize";
+
+describe("budget adherence", async () => {
+  it("stays within token budget", async () => {
+    const tok = await createTokenizer();
+    const text = Array.from({length: 200}, (_,i) => `Line ${i} with error and expected/received`).join("\n");
+    const out = await compress(text, { budgetTokens: 120 });
+    expect(tok.estimateTokens(out)).toBeLessThanOrEqual(120);
+  });
+});
+```
+
+### `packages/nl-compress/__tests__/compress-deterministic.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { compress } from "../src/index";
+
+describe("determinism", async () => {
+  it("same input -> same output", async () => {
+    const t = "Error X\nat a/b.ts:1:1\n\nMore details...\n\nExpected 4, received 5.";
+    const a = await compress(t, { budgetTokens: 60 });
+    const b = await compress(t, { budgetTokens: 60 });
+    expect(a).toEqual(b);
+  });
+});
+```
+
+### `tests/working-set-notes-compressed.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { resolve } from "path";
+import { buildIndex } from "../packages/repo-index/src/index";
+import { selectWorkingSet } from "../packages/repo-index/src/working-set";
+import { readFileSync } from "fs";
+import { createTokenizer } from "../packages/repo-index/src/tokenize";
+
+describe("working-set uses compressed notes", async () => {
+  it("notes honor ~5% budget and are shorter than raw", async () => {
+    const root = resolve("fixtures/ts-mini");
+    await buildIndex(root);
+    const raw = readFileSync(resolve(root, "ISSUE.md"), "utf8").repeat(5); // inflate
+    const { pack } = await selectWorkingSet(root, { task: raw, budgetTokens: 4000, radius: 1 });
+    const tok = await createTokenizer();
+    expect(tok.estimateTokens(pack.notes)).toBeLessThanOrEqual(Math.floor(4000 * 0.05) + 5);
+    expect(pack.notes.length).toBeLessThan(raw.length);
+  });
+});
+```
+
+### `tests/mcp-nl-compress.test.ts` (only if you added the MCP tool)
+
+```ts
+import { describe, it, expect } from "vitest";
+import { spawn } from "child_process";
+
+async function rpc(proc: any, id: number, method: string, params?: any) {
+  proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  const line: string = await new Promise(res => proc.stdout.once("data", (b: Buffer) => res(b.toString("utf8").trim())));
+  return JSON.parse(line);
+}
+
+describe("MCP nl.compress", () => {
+  it("compresses text under budget", async () => {
+    const proc = spawn("node", ["packages/repo-mcp/dist/bin/repo-mcp.js"], { stdio: ["pipe","pipe","pipe"] });
+    await rpc(proc, 1, "tools/call", { name: "repo.graphBuild", arguments: {} });
+    const res = await rpc(proc, 2, "tools/call", { name: "repo.nl.compress", arguments: { text: "Error here\nDetails...\n".repeat(50), budgetTokens: 60 } });
+    expect(res.result.text.length).toBeGreaterThan(0);
+    proc.kill();
+  }, 15000);
+});
+```
+
+---
+
+## Acceptance Criteria (PR 6)
+
+* `bun run build && bun run test` passes.
+* `selectWorkingSet` produces `pack.notes` using **extractive compression**:
+
+  * All output lines are present verbatim in the input task text.
+  * Token count of `pack.notes` ≤ \~5% of total budget (config above).
+* Deterministic: same input → same compressed output.
+* Optional MCP tool `repo.nl.compress` works and obeys budgets.
+* If `@dqbd/tiktoken` is available, token counts reflect BPE; otherwise heuristic fallback keeps budgets ≤ target.
+
+---
+
+## Agent usage note
+
+Nothing to change in the agent file: it already says “Include NOTES verbatim (do **not** paraphrase).” Now those notes are automatically compressed extractively with budgets, which tightens prompts and boosts cache hit rates.
+
+---
+
+## PR description (paste)
+
+**Title:** PR 6 — Extractive NL compression for NOTES + real token counting (tiktoken fallback)
+
+**Summary:**
+Adds a faithful, extractive compressor that segments issues/logs, scores for relevance (stack lines, keywords, position), selects with MMR for diversity, and packs to a token budget using a pluggable tokenizer (tiktoken if available, heuristic otherwise). Integrates into `selectWorkingSet` to shrink `pack.notes`; optionally exposes `repo.nl.compress` via MCP. Includes tests for faithfulness, determinism, and budget adherence.
+
+**How to test:**
+
+1. `bun run build`
+2. `bun run test`
+
+---
+
+If you want, I’ll line up **PR 7** next: the **“don’t drop anything” safety net + metrics** (line-recall checker, frontier auto-expand, and a tiny eval harness).
+

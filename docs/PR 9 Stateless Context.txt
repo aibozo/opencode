@@ -1,0 +1,286 @@
+# PR 9 — Stateless Context Frame Delivery (non-additive), Recent Edits, and Prefix Blocks
+
+## Why (delta from PR 4/5)
+
+* Today, `repo.workingSet.select` returns a JSON pack. The model *can* read JSON, but it reasons best over a **human-readable, delimited context frame**.
+* We want **stateless turns** (no threaded history) and **non-additive context** (one frame per turn).
+* We also want **temporal coherence** without bloat: include the **last N edits** (1-liners) *inside* the frame.
+
+**This PR adds:**
+
+1. A pre-rendered **`context_block`** (text) + **`prefix_block`** (stable rules) and both hashes.
+2. A canonical **`<CONTEXT_FRAME …>`** format the agent uses directly.
+3. A plugin guard to **replace any prior frame** (hard non-additive).
+4. “Recent edits (last 20)” rendered into the frame from `@state-log`.
+
+---
+
+## Changes at a glance
+
+* `@opencode/prompt-kit`: new `renderContextFrame(...)` and `frameSha256(...)`.
+* `@opencode/state-log`: add `recentEdits(n)` (thin wrapper over `summarize`).
+* `@opencode/repo-mcp`: `repo.workingSet.select` now returns `{ pack, debug, context_block, prefix_block, prefix_sha256, frame_sha256 }`.
+* `.opencode/agent/semantic-compress.md`: tiny behavior tweak—**use `context_block` verbatim**; do not rebuild the pack by hand.
+* `.opencode/plugin/context-pack.ts`: enforce **single frame** (remove older `<CONTEXT_FRAME>` blocks if any) and insert prefix if missing.
+* Tests: tool response shape, frame determinism, single-frame enforcement, recent-edits inclusion.
+
+---
+
+## File diffs
+
+### 1) `packages/prompt-kit/src/index.ts`
+
+```ts
+import { readFileSync } from "fs";
+import crypto from "crypto";
+import type { ContextPack } from "@opencode/shared/src/types";
+
+export function stablePrefixBlock(): { text: string; sha256: string } {
+  const agents = readFileSync("AGENTS.md", "utf8").trim();
+  const standards = readFileSync("docs/dev-standards.md", "utf8").trim();
+  const text = [
+    "## Stable Project Rules",
+    agents,
+    "",
+    "## Coding Standards",
+    standards
+  ].join("\n");
+  const sha256 = crypto.createHash("sha256").update(text).digest("hex");
+  return { text, sha256 };
+}
+
+export function renderContextPack(pack: ContextPack): string {
+  const out: string[] = ["## FULL"];
+  for (const f of pack.full) {
+    if (f.ranges?.length) for (const [a,b] of f.ranges) out.push(`- ${f.path} [L${a}-${b}]`);
+    else out.push(`- ${f.path} [FULL]`);
+  }
+  out.push("", "## SKELETON");
+  for (const s of pack.skeletons) out.push(`- ${s.path} (elided; sha1=${(s.hash ?? "").slice(0,7)}…)`);
+  if (pack.interfaces?.length) {
+    out.push("", "## INTERFACES");
+    for (const i of pack.interfaces) out.push(`- ${i.path}`);
+  }
+  return out.join("\n");
+}
+
+export function renderContextFrame(opts: {
+  pack: ContextPack;
+  notes: string;
+  recentEdits?: string; // already 1-liners
+  frameId: string;
+  prefixSha256: string;
+}): { text: string; sha256: string } {
+  const body = [
+    `<CONTEXT_FRAME id=${opts.frameId} prefix_sha=${opts.prefixSha256}>`,
+    "# INSTRUCTIONS",
+    "- Use ONLY this frame for coding decisions.",
+    "- If you need code bodies, call repo.code.readSpan(path,start,end).",
+    "",
+    "# WORKING SET (token-capped)",
+    renderContextPack(opts.pack),
+    "",
+    "# NOTES (extractive, verbatim)",
+    opts.notes.trim(),
+    "",
+    "# RECENT EDITS (last 20)",
+    (opts.recentEdits ?? "(no recent edits)").trim(),
+    "",
+    "# GUARANTEES",
+    "- All edited lines must be within FULL spans or readSpan results.",
+    "</CONTEXT_FRAME>"
+  ].join("\n");
+  const sha256 = crypto.createHash("sha256").update(body).digest("hex");
+  return { text: body, sha256 };
+}
+```
+
+### 2) `packages/state-log/src/index.ts` (add)
+
+```ts
+export function recentEdits(n = 20): string {
+  return summarize(n); // reuse existing, already returns lines like: - [ts] why: ... | what: ... | next: ...
+}
+```
+
+### 3) `packages/repo-mcp/src/server.ts` (augment `repo.workingSet.select`)
+
+```ts
+import { stablePrefixBlock, renderContextFrame } from "@opencode/prompt-kit/src/index";
+import { recentEdits } from "@opencode/state-log/src/index";
+import { v4 as uuidv4 } from "uuid";
+// ...
+
+case "repo.workingSet.select": {
+  const p = ZSelectArgs.parse(args ?? {});
+  const { pack, debug } = await selectWorkingSet(root, p);
+
+  // Build text frame + include prefix
+  const { text: prefix_block, sha256: prefix_sha256 } = stablePrefixBlock();
+  const frameId = uuidv4();
+  const { text: context_block, sha256: frame_sha256 } = renderContextFrame({
+    pack,
+    notes: pack.notes,
+    recentEdits: recentEdits(20),
+    frameId,
+    prefixSha256: prefix_sha256
+  });
+
+  return { pack, debug, context_block, prefix_block, prefix_sha256, frame_sha256, frame_id: frameId, version: "9.0" };
+}
+```
+
+### 4) `.opencode/agent/semantic-compress.md` (delta excerpt)
+
+```md
+## After calling repo.workingSet.select
+- Insert the returned **`prefix_block`** (if not already present) and the **`context_block`** verbatim into your reply.
+- Do NOT reformat the pack into your own structure. Use the provided block.
+- Treat older `<CONTEXT_FRAME ...>` blocks as obsolete; only the latest applies.
+```
+
+### 5) `.opencode/plugin/context-pack.ts` (enforce single frame)
+
+```ts
+const FRAME_RE = /<CONTEXT_FRAME[^>]*>[\s\S]*?<\/CONTEXT_FRAME>/g;
+
+export function onPreSendPrompt(prompt: string) {
+  const { text: prefix, sha256 } = stablePrefixBlock();
+
+  // Ensure prefix exists up top (idempotent)
+  const withPrefix = prompt.includes("## Stable Project Rules") ? prompt : `${prefix}\n\n${prompt}`;
+
+  // Enforce single context frame: keep only the last one if multiple
+  const frames = withPrefix.match(FRAME_RE) ?? [];
+  let next = withPrefix;
+  if (frames.length > 1) {
+    next = withPrefix.replace(FRAME_RE, ""); // strip all
+    next = `${frames[frames.length - 1]}\n\n${next}`; // reinsert the newest at the top of the user content
+  }
+
+  // Nudge if NO frame is present
+  if (!FRAME_RE.test(next)) {
+    next = `<!-- WARNING: no CONTEXT_FRAME detected; call repo.workingSet.select and include context_block -->\n${next}`;
+  }
+
+  // Stamp prefix hash for cache drift tracking
+  return `<!-- prefix_sha256=${sha256} -->\n${next}`;
+}
+```
+
+---
+
+## Tests
+
+### `tests/mcp-select-returns-frame.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { spawn } from "child_process";
+import { resolve } from "path";
+import { readFileSync } from "fs";
+
+async function rpc(proc:any, id:number, method:string, params?:any){
+  proc.stdin.write(JSON.stringify({ jsonrpc:"2.0", id, method, params })+"\n");
+  const line:string = await new Promise(res => proc.stdout.once("data", (b:Buffer)=>res(b.toString("utf8").trim())));
+  return JSON.parse(line);
+}
+
+describe("workingSet.select returns pre-rendered frame + prefix", ()=>{
+  it("includes context_block and hashes", async ()=>{
+    const proc = spawn("node", ["packages/repo-mcp/dist/bin/repo-mcp.js"], { stdio:["pipe","pipe","pipe"], env:{...process.env, REPO_ROOT: resolve("fixtures/ts-mini")} });
+    await rpc(proc,1,"tools/call",{ name:"repo.graphBuild", arguments:{} });
+    const issue = readFileSync(resolve("fixtures/ts-mini/ISSUE.md"),"utf8");
+    const r = await rpc(proc,2,"tools/call",{ name:"repo.workingSet.select", arguments:{ task: issue, budgetTokens: 3000, radius:1 } });
+    expect(r.result.context_block).toMatch(/<CONTEXT_FRAME .*?>/);
+    expect(r.result.prefix_block).toMatch(/## Stable Project Rules/);
+    expect(r.result.prefix_sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(r.result.frame_sha256).toMatch(/^[0-9a-f]{64}$/);
+    proc.kill();
+  }, 15000);
+});
+```
+
+### `tests/plugin-single-frame.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { onPreSendPrompt } from "../.opencode/plugin/context-pack";
+
+describe("plugin keeps one frame", ()=>{
+  it("removes older frames", ()=>{
+    const p = "<CONTEXT_FRAME id=1>...</CONTEXT_FRAME>\nblah\n<CONTEXT_FRAME id=2>new</CONTEXT_FRAME>";
+    const out = onPreSendPrompt(p);
+    const frames = out.match(/<CONTEXT_FRAME[^>]*>/g) ?? [];
+    expect(frames.length).toBe(1);
+    expect(out).toContain("id=2");
+  });
+});
+```
+
+### `tests/frame-includes-recent-edits.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { renderContextFrame, stablePrefixBlock } from "../packages/prompt-kit/src/index";
+
+describe("frame includes recent edits", ()=>{
+  it("renders recent edits section", ()=>{
+    const { sha256 } = stablePrefixBlock();
+    const { text } = renderContextFrame({
+      pack: { full:[], skeletons:[], interfaces:[], search_hits:[], notes:"", budget:{target:1000, used:0} } as any,
+      notes: "Traceback...",
+      recentEdits: "- [ts] why: fix | what: x.ts:10-20",
+      frameId: "abc",
+      prefixSha256: sha256
+    });
+    expect(text).toMatch(/# RECENT EDITS/);
+    expect(text).toMatch(/why: fix/);
+  });
+});
+```
+
+---
+
+## Agent usage (one line)
+
+In `.opencode/agent/semantic-compress.md`, we already added: **“Insert `context_block` & `prefix_block` verbatim”**. Keep the rest of the loop the same.
+
+---
+
+## Operational note: true stateless turns
+
+When calling the OpenAI Responses API directly, **do not pass `previous_response_id`** between turns. Each call includes:
+
+* `system`: `prefix_block`
+* `user`: `context_block` + your immediate instruction
+  (Within a single response, the model can still call tools; that remains unchanged.)
+
+---
+
+## Acceptance criteria
+
+* `repo.workingSet.select` returns `context_block`, `prefix_block`, `prefix_sha256`, `frame_sha256`, `frame_id`.
+* `context_block` is well-formed (`<CONTEXT_FRAME …>…</CONTEXT_FRAME>`), includes **WORKING SET**, **NOTES**, **RECENT EDITS**, and guard instructions.
+* Plugin guarantees **exactly one** frame in the final outbound prompt; warns if none exists.
+* Tests above pass; existing suites remain green.
+* Minimal/no token regression (the frame replaces ad-hoc pack text, not appended to it).
+
+---
+
+## PR description (paste)
+
+**Title:** PR 9 — Stateless, non-additive Context Frame delivery (+ recent edits & prefix blocks)
+
+**Summary:**
+Adds a pre-rendered, human-readable context frame (`context_block`) and stable rules header (`prefix_block`) to `repo.workingSet.select`, including hashes for cache and audit. The agent now inserts these verbatim, yielding stateless, non-additive prompts: one frame per turn with precise spans, skeletal neighbors, extractive notes, and the last 20 edits. A plugin guard enforces single-frame presence and stamps the prefix hash. Tests cover tool response shape, single-frame enforcement, and recent-edits rendering.
+
+**How to test:**
+
+1. `bun run build`
+2. `bun run test`
+
+---
+
+If you want, I can also add a tiny **stateless runner CLI** (optional) that demos the one-shot Responses API call using `context_block` + `prefix_block`.
+

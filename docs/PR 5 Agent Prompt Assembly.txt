@@ -1,0 +1,432 @@
+
+# PR 5 — Agent Prompt Assembly, Stable Prefix, Span-First Behavior, Decision Log
+
+## Objectives
+
+* Make the **semantic-compress** agent *use* our MCP tools correctly.
+* Assemble prompts with a **stable prefix** (for OpenAI cache hits) and a **variable tail** (current Context Pack + diffs).
+* Enforce **span-first** reading (never whole files unless tests/small).
+* Maintain a **decision log** across turns for temporal coherence.
+* Provide utilities + tests so this is deterministic and safe.
+
+---
+
+## Changes at a glance
+
+* Update `.opencode/agent/semantic-compress.md` with precise tool-usage and layout.
+* Implement `packages/prompt-kit` to render Context Packs into compact prompt text and build a stable prefix block.
+* Implement `packages/state-log` to persist decisions/TODOs between turns.
+* Flesh out `.opencode/plugin/context-pack.ts` with guardrails (span-first nudge + secret path deny) and attach the stable prefix automatically.
+* Tests for stable prefix hash, prompt layout, span-first policy, and decision-log behavior.
+
+---
+
+## Files to add/update
+
+### 1) Agent behavior (replace file)
+
+**`.opencode/agent/semantic-compress.md`**
+
+```md
+# Agent: semantic-compress (PR 5)
+
+## Contract
+You are a code-editing agent for this repository. Always follow this loop:
+
+1) **Warm the index**
+   - Call `repo.graphBuild`.
+
+2) **Select working set**
+   - Call `repo.workingSet.select` with:
+     - `task`: full user issue/trace/context
+     - `budgetTokens`: 64000 (unless told otherwise)
+     - `radius`: 1 (bump to 2 only if types/interfaces missing)
+     - `preferSpanContext`: true
+     - `windowLines`: 60
+
+3) **Assemble your prompt to yourself** (structure below)
+   - Include FULL ranges and SKELETON neighbors from the pack.
+   - Include NOTES verbatim (do NOT paraphrase).
+
+4) **Plan → Patch**
+   - Write a short plan.
+   - Produce a minimal unified diff.
+   - Apply via `patch` tool or `repo.git.applyPatch` (if exposed).
+
+5) **Test**
+   - Run tests via project tooling (if available) or describe test steps.
+   - If an error references unknown code, request **only** the smallest lines via `repo.code.readSpan(path, start, end)` and repeat.
+
+6) **Decision log**
+   - Append concise entries:
+     - `why`: rationale for the change
+     - `what`: files/symbols affected
+     - `next`: TODOs / open questions
+   - Keep the last ~10 entries in view.
+
+## Span-first rule
+- **Never request an entire file** unless:
+  - It’s a test file, or
+  - The file is < 200 tokens by estimate, or
+  - You explicitly justify why a full read is needed.
+- Prefer `repo.code.readSpan` with exact `start..end` lines.
+
+## Prompt layout (you output this structure in your reply)
+```
+
+# Task
+
+<brief restatement>
+
+# Plan
+
+* ...
+
+# Working Set (token-capped)
+
+## FULL
+
+* <path> \[L<start>-<end>] (one or more spans per file)
+
+## SKELETON
+
+* <path> (bodies elided; sha1=<...>)
+
+## INTERFACES
+
+* <path>
+
+# Notes (verbatim)
+
+\<pack.notes>
+
+# Edits (Unified Diff)
+
+<diff>
+
+# Decision Log (append)
+
+* \[time] why: ...
+* \[time] what: ...
+* \[time] next: ...
+
+```
+
+## Tool quick-reference
+- `repo.graphBuild` → idempotent.
+- `repo.workingSet.select` → returns Context Pack under budget.
+- `repo.code.readSpan(path, start, end)` → smallest slice only.
+- `repo.code.skeleton(path)` → signatures/docstrings when you need structure.
+- `repo.code.search(pattern, globs?)` → quick grep.
+```
+
+---
+
+### 2) Prompt utilities
+
+**`packages/prompt-kit/package.json`**
+
+```json
+{
+  "name": "@opencode/prompt-kit",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "devDependencies": { "typescript": "^5.5.4" }
+}
+```
+
+**`packages/prompt-kit/tsconfig.json`**
+
+```json
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "rootDir": "src", "outDir": "dist" }, "include": ["src"] }
+```
+
+**`packages/prompt-kit/src/index.ts`**
+
+```ts
+import { readFileSync } from "fs";
+import crypto from "crypto";
+import type { ContextPack } from "@opencode/shared/src/types";
+
+export function stablePrefixBlock(): { text: string; sha256: string } {
+  const agents = readFileSync("AGENTS.md", "utf8");
+  const standards = readFileSync("docs/dev-standards.md", "utf8");
+  const header = [
+    "## Stable Project Rules",
+    agents.trim(),
+    "",
+    "## Coding Standards",
+    standards.trim()
+  ].join("\n");
+  const sha256 = crypto.createHash("sha256").update(header).digest("hex");
+  return { text: header, sha256 };
+}
+
+export function renderContextPack(pack: ContextPack): string {
+  const lines: string[] = [];
+  lines.push("## FULL");
+  for (const f of pack.full) {
+    if (f.ranges?.length) {
+      for (const [a,b] of f.ranges) lines.push(`- ${f.path} [L${a}-${b}]`);
+    } else {
+      lines.push(`- ${f.path} [FULL]`);
+    }
+  }
+  lines.push("", "## SKELETON");
+  for (const s of pack.skeletons) lines.push(`- ${s.path} (elided; sha1=${(s.hash ?? "").slice(0,7)}…)`);
+  if (pack.interfaces?.length) {
+    lines.push("", "## INTERFACES");
+    for (const i of pack.interfaces) lines.push(`- ${i.path}`);
+  }
+  if (pack.search_hits?.length) {
+    lines.push("", "## SEARCH HITS (top)");
+    for (const h of pack.search_hits.slice(0,10)) lines.push(`- ${h.path}:${h.line} ${h.text}`);
+  }
+  return lines.join("\n");
+}
+
+export function assemblePrompt(pack: ContextPack, notes: string, plan: string): string {
+  const { text: prefix } = stablePrefixBlock();
+  const ctx = renderContextPack(pack);
+  return [
+    prefix,
+    "",
+    "# Task",
+    "(see conversation above for full task; restated briefly here by the agent)",
+    "",
+    "# Plan",
+    plan.trim(),
+    "",
+    "# Working Set (token-capped)",
+    ctx,
+    "",
+    "# Notes (verbatim)",
+    notes.trim()
+  ].join("\n");
+}
+```
+
+---
+
+### 3) Decision log utilities
+
+**`packages/state-log/package.json`**
+
+```json
+{
+  "name": "@opencode/state-log",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "devDependencies": { "typescript": "^5.5.4" }
+}
+```
+
+**`packages/state-log/tsconfig.json`**
+
+```json
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "rootDir": "src", "outDir": "dist" }, "include": ["src"] }
+```
+
+**`packages/state-log/src/index.ts`**
+
+```ts
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "fs";
+import { dirname } from "path";
+
+export interface DecisionEntry {
+  ts: string; // ISO
+  why: string;
+  what: string;
+  next?: string;
+}
+export interface DecisionState { entries: DecisionEntry[]; }
+
+const PATH = ".opencode/state/decision-log.json";
+
+export function loadLog(): DecisionState {
+  if (!existsSync(PATH)) return { entries: [] };
+  try { return JSON.parse(readFileSync(PATH, "utf8")) as DecisionState; }
+  catch { return { entries: [] }; }
+}
+
+export function appendDecision(e: Omit<DecisionEntry,"ts">) {
+  const state = loadLog();
+  state.entries.push({ ts: new Date().toISOString(), ...e });
+  mkdirSync(dirname(PATH), { recursive: true });
+  writeFileSync(PATH, JSON.stringify(state, null, 2));
+}
+
+export function summarize(limit = 10): string {
+  const s = loadLog();
+  const tail = s.entries.slice(-limit);
+  if (!tail.length) return "(no prior decisions)";
+  return tail.map(x => `- [${x.ts}] why: ${x.why} | what: ${x.what}${x.next ? ` | next: ${x.next}` : ""}`).join("\n");
+}
+```
+
+---
+
+### 4) Plugin guardrails (expand stub)
+
+**`.opencode/plugin/context-pack.ts`**
+
+```ts
+import { stablePrefixBlock } from "../../packages/prompt-kit/src/index";
+
+const SENSITIVE = /\.(env|aws|ssh|git)(\.|\/|$)/i;
+
+export function onPreSendPrompt(prompt: string) {
+  // Attach stable prefix if caller forgot (idempotent)
+  const { text, sha256 } = stablePrefixBlock();
+  const hasPrefix = prompt.includes("## Stable Project Rules") && prompt.includes("## Coding Standards");
+  let next = hasPrefix ? prompt : `${text}\n\n${prompt}`;
+
+  // Soft guard: if the prompt includes a request for a whole file outside tests, add a nudge note.
+  if (/\[FULL\]/.test(next) && !/tests?\//i.test(next)) {
+    next = `<!-- Hint: prefer readSpan for non-test files -->\n${next}`;
+  }
+
+  // Deny obviously sensitive filenames
+  if (SENSITIVE.test(next)) {
+    next = `<!-- WARNING: sensitive filename detected; remove from prompt -->\n${next}`;
+  }
+
+  // Expose prefix hash for debugging (useful to watch cache stability)
+  next = `<!-- prefix_sha256=${sha256} -->\n${next}`;
+  return next;
+}
+```
+
+> This runs in our tests; OpenCode may or may not call it automatically. It still gives you a callable pre-flight you can invoke in wrappers or scripts.
+
+---
+
+## Tests
+
+**Add to root `package.json` workspaces:** `"packages/prompt-kit", "packages/state-log"`
+
+### `tests/prefix-stable-pr5.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { stablePrefixBlock } from "../packages/prompt-kit/src/index";
+
+describe("stable prefix block", () => {
+  it("has deterministic sha256", () => {
+    const a = stablePrefixBlock();
+    const b = stablePrefixBlock();
+    expect(a.sha256).toEqual(b.sha256);
+    expect(a.text.length).toBeGreaterThan(50);
+  });
+});
+```
+
+### `tests/prompt-assembly.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { assemblePrompt } from "../packages/prompt-kit/src/index";
+
+const dummy = {
+  full: [{ path: "src/x.py", ranges: [[10, 40]] }, { path: "tests/test_x.py" }],
+  skeletons: [{ path: "src/y.py", hash: "abc123" }],
+  interfaces: [{ path: "src/types.ts" }],
+  search_hits: [{ path: "src/x.py", line: 12, text: "foo()", score: 1 }],
+  notes: "Traceback...",
+  budget: { target: 64000, used: 1234 }
+};
+
+describe("assemble prompt", () => {
+  it("renders sections in correct order", () => {
+    const out = assemblePrompt(dummy as any, "Traceback...", "- edit x.py");
+    expect(out).toMatch(/## Stable Project Rules/);
+    expect(out).toMatch(/# Working Set/);
+    expect(out).toMatch(/## FULL/);
+    expect(out).toMatch(/src\/x\.py \[L10-40\]/);
+    expect(out).toMatch(/tests\/test_x\.py \[FULL\]/);
+    expect(out).toMatch(/## SKELETON/);
+  });
+});
+```
+
+### `tests/plugin-guards.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { onPreSendPrompt } from "../.opencode/plugin/context-pack";
+
+describe("plugin guards", () => {
+  it("adds prefix when missing and nudges on FULL", () => {
+    const out = onPreSendPrompt("# Working Set\n## FULL\n- src/app.ts [FULL]\n");
+    expect(out).toMatch(/Stable Project Rules/);
+    expect(out).toMatch(/prefix_sha256=/);
+    expect(out).toMatch(/prefer readSpan/);
+  });
+});
+```
+
+### `tests/state-log.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { appendDecision, loadLog, summarize } from "../packages/state-log/src/index";
+import { rmSync } from "fs";
+
+describe("decision log", () => {
+  it("appends and summarizes", () => {
+    rmSync(".opencode/state", { recursive: true, force: true });
+    appendDecision({ why: "fix add()", what: "src/mathy.ts" });
+    appendDecision({ why: "adjust test", what: "test/mathy.test.ts", next: "re-run" });
+    const s = summarize(2);
+    expect(s).toMatch(/why: fix add/);
+    expect(loadLog().entries.length).toBe(2);
+  });
+});
+```
+
+---
+
+## Acceptance Criteria (PR 5)
+
+* `bun run build && bun run test` all green.
+* `assemblePrompt` produces: **Stable Prefix → Task → Plan → Working Set → Notes** in that exact order.
+* `onPreSendPrompt`:
+
+  * attaches the stable prefix if absent,
+  * warns on non-test `[FULL]` files,
+  * emits `prefix_sha256=...` marker.
+* `state-log` persists entries and `summarize()` returns last N lines.
+* The agent doc **explicitly** instructs: `repo.graphBuild` → `repo.workingSet.select` → span-first edits/tests → decision log.
+
+---
+
+## How this boosts OpenAI caching (no extra flags)
+
+* The big, rarely-changing **Stable Prefix** stays byte-identical turn-to-turn → **prefix cache hits**.
+* Variable tail (Context Pack + diffs) changes, but it’s appended **after** the prefix.
+* `prefix_sha256` gives you a quick way to spot drift.
+
+---
+
+## PR description (paste)
+
+**Title:** PR 5 — Agent prompt assembly, stable prefix, span-first policy, and decision log
+
+**Summary:**
+Defines the semantic-compress agent loop and prompt layout; adds a prompt-kit to render Context Packs with a stable prefix for OpenAI caching; adds a state-log for temporal coherence; and updates the plugin with span-first nudges and prefix attachment. Includes tests for prefix determinism, prompt layout, guardrails, and decision logging.
+
+**How to test:**
+
+1. `bun run build`
+2. `bun run test`
+
+---
+
+If you’re happy, next I’ll spec **PR 6** (extractive NL compression for NOTES + optional real BPE token counting) so we can slash natural-language overhead without losing fidelity.
+

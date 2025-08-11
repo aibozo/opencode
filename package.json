@@ -6,6 +6,11 @@
   "packageManager": "bun@1.2.14",
   "scripts": {
     "dev": "bun run --conditions=development packages/opencode/src/index.ts",
+    "dev:repo-mcp": "node packages/repo-mcp/dist/bin/repo-mcp.js",
+    "build": "bun run --cwd packages/prompt-kit build && bun run --cwd packages/state-log build && bun run --cwd packages/nl-compress build && bun run --cwd packages/metrics build && bun run --cwd packages/repo-index build && bun run --cwd packages/repo-mcp build && bun run --cwd packages/eval-runner build",
+    "test": "bun run build && node script/test-runner.js",
+    "demo:mcp": "bun run script/mcp-demo.ts",
+    "demo:mcp:node": "node script/mcp-demo-node.mjs",
     "typecheck": "bun run --filter='*' typecheck",
     "stainless": "./scripts/stainless",
     "postinstall": "./script/hooks"
@@ -26,8 +31,11 @@
     }
   },
   "devDependencies": {
+    "node-gyp": "11.3.0",
     "prettier": "3.5.3",
-    "sst": "3.17.8"
+    "sst": "3.17.8",
+    "typescript": "5.8.2",
+    "vitest": "2.0.5"
   },
   "repository": {
     "type": "git",
@@ -41,7 +49,11 @@
   "trustedDependencies": [
     "esbuild",
     "protobufjs",
-    "sharp"
+    "sharp",
+    "tree-sitter",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript"
   ],
   "patchedDependencies": {}
 }

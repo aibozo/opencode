@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "openai/gpt-4.1",
+  "instructions": [
+    "AGENTS.md",
+    "docs/dev-standards.md"
+  ],
+  "agents": {
+    "semantic-compress": {
+      "model": "openai/gpt-4.1",
+      "prompt": "{file:.opencode/agent/semantic-compress.md}"
+    }
+  },
+  "mcp": {
+    "repo-graph": {
+      "type": "local",
+      "command": ["node", "packages/repo-mcp/dist/bin/repo-mcp.js"],
+      "enabled": true
+    }
+  }
+}

@@ -1,0 +1,4 @@
+{"sessionId":"d0df8c6e-d8c9-44ba-b2ae-457c5d6fb312","root":"/home/kil/dev/opencode/fixtures/ts-mini","full":[{"path":"src/mathy.ts","start":1,"end":66},{"path":"test/mathy.test.ts","start":1,"end":5}],"spans":[],"when":"2025-08-11T02:57:34.425Z"}
+{"sessionId":"d0df8c6e-d8c9-44ba-b2ae-457c5d6fb312","root":"/home/kil/dev/opencode/fixtures/ts-mini","full":[{"path":"src/mathy.ts","start":1,"end":66},{"path":"test/mathy.test.ts","start":1,"end":5}],"spans":[],"when":"2025-08-11T02:57:34.428Z"}
+{"sessionId":"7cd523f4-20f5-4df5-8597-c6f3eb8696fd","root":"/tmp/opencode-eval-nyVKsu","full":[{"path":"src/mathy.ts","start":1,"end":66},{"path":"test/mathy.test.ts","start":1,"end":5}],"spans":[],"when":"2025-08-11T02:57:34.507Z"}
+{"sessionId":"f09b7461-9f10-4e6e-9f2b-e5b8a0d3a333","root":"/tmp/opencode-eval-AUkBTC","full":[{"path":"pkg/mathy.py","start":1,"end":70},{"path":"tests/test_mathy.py","start":1,"end":10}],"spans":[],"when":"2025-08-11T02:57:34.513Z"}

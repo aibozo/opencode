@@ -1,0 +1,26 @@
+{
+  "name": "@opencode/repo-index",
+  "version": "0.0.0",
+  "type": "module",
+  "bin": {
+    "repo-index": "./bin/repo-index.ts"
+  },
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "fast-glob": "^3.3.2",
+    "@opencode/nl-compress": "0.0.0",
+    "tree-sitter": "0.22.4",
+    "tree-sitter-python": "^0.23.0",
+    "tree-sitter-javascript": "^0.23.0",
+    "tree-sitter-typescript": "^0.23.0"
+  },
+  "optionalDependencies": {
+    "@dqbd/tiktoken": "^1.0.15"
+  },
+  "devDependencies": {
+    "typescript": "5.8.2"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  }
+}

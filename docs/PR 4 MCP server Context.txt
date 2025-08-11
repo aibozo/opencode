@@ -1,0 +1,407 @@
+# PR 4 — MCP server: Context Pack + Span Reads + Skeleton + Search
+
+## Objectives
+
+* Implement a **real MCP server** over stdio (JSON-RPC 2.0).
+* Expose the tools your agent will rely on:
+
+  * `repo.graphBuild`
+  * `repo.workingSet.select`
+  * `repo.code.readSpan`
+  * `repo.code.skeleton`
+  * `repo.code.search`
+  * `repo.info.stats` (handy debug)
+* Enforce **safety**: root-relative paths only, deny secrets, clamp span sizes.
+* Add **integration tests** that perform a mini hand-shake and call tools.
+* Keep OpenAI-first config unchanged; OpenCode will discover the tools.
+
+---
+
+## Package changes
+
+### `packages/repo-mcp/package.json` (deps)
+
+```json
+{
+  "dependencies": {
+    "@opencode/repo-index": "0.0.0",
+    "@modelcontextprotocol/sdk": "^0.5.0",
+    "@modelcontextprotocol/sdk/types": "^0.5.0",
+    "zod": "^3.23.8",
+    "minimatch": "^9.0.4"
+  }
+}
+```
+
+> If the agent balks on the exact SDK version, allow the latest `^0.x` within semver and pin after CI is green.
+
+---
+
+## Server implementation
+
+### `packages/repo-mcp/src/schemas.ts` (zod schemas for tool I/O)
+
+```ts
+import { z } from "zod";
+
+export const ZSelectArgs = z.object({
+  task: z.string().min(1),
+  budgetTokens: z.number().int().positive().optional(),
+  radius: z.union([z.literal(1), z.literal(2)]).optional(),
+  preferSpanContext: z.boolean().optional(),
+  windowLines: z.number().int().positive().max(2000).optional()
+});
+
+export const ZReadSpanArgs = z.object({
+  path: z.string().min(1),
+  start: z.number().int().positive(),
+  end: z.number().int().positive()
+});
+
+export const ZSkeletonArgs = z.object({
+  path: z.string().min(1)
+});
+
+export const ZSearchArgs = z.object({
+  pattern: z.string().min(1),
+  globs: z.array(z.string()).optional(),
+  maxHits: z.number().int().positive().max(500).optional()
+});
+
+export type SelectArgs = z.infer<typeof ZSelectArgs>;
+export type ReadSpanArgs = z.infer<typeof ZReadSpanArgs>;
+export type SkeletonArgs = z.infer<typeof ZSkeletonArgs>;
+export type SearchArgs = z.infer<typeof ZSearchArgs>;
+```
+
+### `packages/repo-mcp/src/paths.ts` (path guards)
+
+```ts
+import { resolve, relative } from "path";
+import { readFileSync } from "fs";
+
+export function normalizeAndCheck(root: string, p: string) {
+  const abs = resolve(root, p);
+  const rel = relative(root, abs).replace(/\\/g, "/");
+  if (rel.startsWith("..")) throw new Error(`Path escapes root: ${p}`);
+  if (/(^|\/)\.(env|env\.local|aws|ssh|git)($|\/)/i.test(rel)) {
+    throw new Error(`Access denied to sensitive path: ${rel}`);
+  }
+  return { abs, rel };
+}
+
+export function readSpan(abs: string, start: number, end: number, maxLines = 8000) {
+  if (end < start) throw new Error("end < start");
+  const lines = readFileSync(abs, "utf8").split(/\r?\n/);
+  const a = Math.max(1, start) - 1;
+  const b = Math.min(end, lines.length) - 1;
+  const count = b - a + 1;
+  if (count > maxLines) throw new Error(`span too large: ${count} > ${maxLines}`);
+  return { text: lines.slice(a, b + 1).join("\n"), total: lines.length };
+}
+```
+
+### `packages/repo-mcp/src/server.ts` (real MCP over stdio)
+
+```ts
+import { createStdioServer } from "@modelcontextprotocol/sdk/server/stdio";
+import { Tool } from "@modelcontextprotocol/sdk/types";
+import { z } from "zod";
+import { ZSelectArgs, ZReadSpanArgs, ZSkeletonArgs, ZSearchArgs } from "./schemas";
+import { buildIndex, ensureWatcher, getIndex } from "@opencode/repo-index/src/index";
+import { selectWorkingSet } from "@opencode/repo-index/src/working-set";
+import { skeletonizeFile } from "@opencode/repo-index/src/skeleton";
+import { grepKeywords, keywordsFromTask } from "@opencode/repo-index/src/search";
+import { normalizeAndCheck, readSpan } from "./paths";
+import { resolve } from "path";
+import crypto from "crypto";
+
+const PKG = { name: "repo-mcp", version: "0.0.4" };
+
+export async function startServer() {
+  const root = process.env.REPO_ROOT ? resolve(process.env.REPO_ROOT) : process.cwd();
+
+  const tools: Tool[] = [
+    {
+      name: "repo.graphBuild",
+      description: "Build or refresh the repository index and start a file watcher.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "repo.info.stats",
+      description: "Return index summary counts for debugging.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "repo.workingSet.select",
+      description: "Select a token-budgeted Context Pack for a task.",
+      inputSchema: ZSelectArgs.toJSON() as any
+    },
+    {
+      name: "repo.code.readSpan",
+      description: "Read a file slice by line numbers (inclusive).",
+      inputSchema: ZReadSpanArgs.toJSON() as any
+    },
+    {
+      name: "repo.code.skeleton",
+      description: "Return a skeleton view and elision metadata for a file.",
+      inputSchema: ZSkeletonArgs.toJSON() as any
+    },
+    {
+      name: "repo.code.search",
+      description: "Find lines matching keywords/patterns (simple grep).",
+      inputSchema: ZSearchArgs.toJSON() as any
+    }
+  ];
+
+  const server = createStdioServer(
+    {
+      name: PKG.name,
+      version: PKG.version,
+      tools
+    },
+    {
+      // Tool router
+      async callTool(name, args) {
+        try {
+          switch (name) {
+            case "repo.graphBuild": {
+              await buildIndex(root);
+              ensureWatcher(root);
+              const idx = getIndex();
+              return { ok: true, root, updatedAt: idx.updatedAt, files: idx.files.length, symbols: idx.symbols.length, edges: idx.edges.length };
+            }
+            case "repo.info.stats": {
+              const idx = getIndex();
+              return { ok: true, root, files: idx.files.length, symbols: idx.symbols.length, edges: idx.edges.length, updatedAt: idx.updatedAt };
+            }
+            case "repo.workingSet.select": {
+              const p = ZSelectArgs.parse(args ?? {});
+              const { pack, debug } = await selectWorkingSet(root, p);
+              return { pack, debug };
+            }
+            case "repo.code.readSpan": {
+              const p = ZReadSpanArgs.parse(args ?? {});
+              const { abs, rel } = normalizeAndCheck(root, p.path);
+              const result = readSpan(abs, p.start, p.end);
+              const sha1 = crypto.createHash("sha1").update(result.text).digest("hex");
+              return { path: rel, start: p.start, end: p.end, lines: result.total, sha1, text: result.text };
+            }
+            case "repo.code.skeleton": {
+              const p = ZSkeletonArgs.parse(args ?? {});
+              const { abs, rel } = normalizeAndCheck(root, p.path);
+              const sk = skeletonizeFile(root, abs);
+              return { path: rel, text: sk.text, elisions: sk.elisions };
+            }
+            case "repo.code.search": {
+              const p = ZSearchArgs.parse(args ?? {});
+              const idx = getIndex();
+              const files = (p.globs && p.globs.length)
+                ? idx.files.filter(f => require("minimatch").minimatch(f, p.globs[0])) // simple single-glob support to start
+                : idx.files;
+              const ks = keywordsFromTask(p.pattern);
+              const hits = grepKeywords(root, files, ks, 10).slice(0, p.maxHits ?? 100);
+              return { hits: hits.map(h => ({ path: h.path.replace(root + "/", ""), line: h.line, text: h.text })) };
+            }
+          }
+          throw new Error(`Unknown tool: ${name}`);
+        } catch (e: any) {
+          return { error: String(e?.message ?? e) };
+        }
+      }
+    }
+  );
+
+  await server.connect();
+}
+```
+
+### `packages/repo-mcp/bin/repo-mcp.ts`
+
+```ts
+#!/usr/bin/env node
+import { startServer } from "../src/server";
+startServer();
+```
+
+> We also keep your old smoke tests updated to speak MCP (below).
+
+---
+
+## Config (OpenCode) — no change needed
+
+`.opencode/opencode.json` already points to:
+
+```json
+"command": ["node", "packages/repo-mcp/dist/bin/repo-mcp.js"]
+```
+
+OpenCode will initialize the server and list the tools automatically.
+
+---
+
+## Tests (integration over MCP)
+
+### `tests/mcp-tools-list.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { spawn } from "child_process";
+
+async function rpc(proc: any, msg: any) {
+  proc.stdin.write(JSON.stringify(msg) + "\n");
+  return await new Promise<string>(res => proc.stdout.once("data", (b: Buffer) => res(b.toString("utf8").trim())));
+}
+
+describe("MCP tools list", () => {
+  it("exposes our repo tools", async () => {
+    const proc = spawn("node", ["packages/repo-mcp/dist/bin/repo-mcp.js"], { stdio: ["pipe","pipe","pipe"] });
+
+    // minimal handshake for stdio server (sdk prints a ready line or responds to 'tools/list')
+    const list = await rpc(proc, { jsonrpc: "2.0", id: 1, method: "tools/list" });
+    const resp = JSON.parse(list);
+    expect(resp.id).toBe(1);
+    const names = resp.result.tools.map((t: any) => t.name);
+    for (const t of ["repo.graphBuild","repo.workingSet.select","repo.code.readSpan","repo.code.skeleton","repo.code.search","repo.info.stats"]) {
+      expect(names).toContain(t);
+    }
+    proc.kill();
+  }, 10000);
+});
+```
+
+### `tests/mcp-select-working-set.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { spawn } from "child_process";
+import { resolve } from "path";
+import { readFileSync } from "fs";
+
+async function rpc(proc: any, id: number, method: string, params?: any) {
+  proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  const line: string = await new Promise(res => proc.stdout.once("data", (b: Buffer) => res(b.toString("utf8").trim())));
+  return JSON.parse(line);
+}
+
+describe("MCP workingSet.select", () => {
+  it("returns a pack with full+skeletal under budget", async () => {
+    const proc = spawn("node", ["packages/repo-mcp/dist/bin/repo-mcp.js"], { stdio: ["pipe","pipe","pipe"], env: { ...process.env, REPO_ROOT: resolve("fixtures/ts-mini") } });
+    await rpc(proc, 1, "tools/call", { name: "repo.graphBuild", arguments: {} });
+    const issue = readFileSync(resolve("fixtures/ts-mini/ISSUE.md"), "utf8");
+    const r = await rpc(proc, 2, "tools/call", { name: "repo.workingSet.select", arguments: { task: issue, budgetTokens: 3000, radius: 1 } });
+    expect(r.result.pack.full.length).toBeGreaterThan(0);
+    expect(r.result.pack.budget.used).toBeLessThanOrEqual(r.result.pack.budget.target);
+    proc.kill();
+  }, 15000);
+});
+```
+
+### `tests/mcp-readspan.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { spawn } from "child_process";
+import { resolve } from "path";
+
+async function rpc(proc: any, id: number, method: string, params?: any) {
+  proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  const line: string = await new Promise(res => proc.stdout.once("data", (b: Buffer) => res(b.toString("utf8").trim())));
+  return JSON.parse(line);
+}
+
+describe("readSpan bounds + sha", () => {
+  it("reads a small span safely", async () => {
+    const proc = spawn("node", ["packages/repo-mcp/dist/bin/repo-mcp.js"], { stdio: ["pipe","pipe","pipe"], env: { ...process.env, REPO_ROOT: resolve("fixtures/py-mini") } });
+    await rpc(proc, 1, "tools/call", { name: "repo.graphBuild", arguments: {} });
+    const res = await rpc(proc, 2, "tools/call", { name: "repo.code.readSpan", arguments: { path: "pkg/mathy.py", start: 1, end: 8 } });
+    expect(res.result.text.length).toBeGreaterThan(0);
+    expect(res.result.sha1).toMatch(/^[0-9a-f]{40}$/);
+    proc.kill();
+  });
+});
+```
+
+### `tests/mcp-skeleton.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { spawn } from "child_process";
+import { resolve } from "path";
+
+async function rpc(proc: any, id: number, method: string, params?: any) {
+  proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  const line: string = await new Promise(res => proc.stdout.once("data", (b: Buffer) => res(b.toString("utf8").trim())));
+  return JSON.parse(line);
+}
+
+describe("skeleton tool", () => {
+  it("returns skeleton text and elisions", async () => {
+    const proc = spawn("node", ["packages/repo-mcp/dist/bin/repo-mcp.js"], { stdio: ["pipe","pipe","pipe"], env: { ...process.env, REPO_ROOT: resolve("fixtures/ts-mini") } });
+    await rpc(proc, 1, "tools/call", { name: "repo.graphBuild", arguments: {} });
+    const res = await rpc(proc, 2, "tools/call", { name: "repo.code.skeleton", arguments: { path: "src/mathy.ts" } });
+    expect(res.result.text).toContain("export function add");
+    expect(res.result.elisions.length).toBeGreaterThan(0);
+    proc.kill();
+  });
+});
+```
+
+---
+
+## Agent doc tweak (optional but useful now)
+
+Update **`.opencode/agent/semantic-compress.md`** to tell the model how to use the tools:
+
+```md
+# Agent: semantic-compress — Tool usage (PR 4)
+
+On each new task:
+1) Call `repo.graphBuild` (idempotent; cheap).
+2) Call `repo.workingSet.select` with the task text, `budgetTokens` (e.g., 64k), and `radius` (1..2).
+3) Include in your prompt:
+   - FULL files/ranges
+   - SKELETON neighbors
+   - NOTES (verbatim extract)
+4) When you need more detail from a file:
+   - Prefer `repo.code.readSpan(path, start, end)` for the smallest required lines.
+   - Use `repo.code.skeleton(path)` to recall interfaces / signatures.
+5) If a symbol or type is missing, repeat step (2) with a larger radius or targeted keywords.
+```
+
+---
+
+## Acceptance criteria (PR 4)
+
+* `bun run build && bun run test` passes.
+* Running `node packages/repo-mcp/dist/bin/repo-mcp.js` responds to:
+
+  * `tools/list` with all tool names
+  * `tools/call` for each tool with valid results
+* `repo.workingSet.select` returns a pack under budget for both fixtures.
+* `repo.code.readSpan` enforces path sandbox + span size; returns sha1 of the slice.
+* `repo.code.skeleton` returns text + elisions (from PR 2).
+* `repo.code.search` returns hits for simple patterns.
+
+---
+
+## PR description (paste)
+
+**Title:** PR 4 — Real MCP server: Context Pack, Span Reads, Skeleton, Search (stdio)
+
+**Summary:**
+Replaces the stub loop with a real MCP stdio server using the MCP SDK. Registers repository tools (`graphBuild`, `workingSet.select`, `code.readSpan`, `code.skeleton`, `code.search`, `info.stats`), adds path and size safety checks, and integration tests that exercise MCP handshake and tool calls against the `py-mini`/`ts-mini` fixtures. OpenCode can now call these tools directly in sessions.
+
+**How to test:**
+
+1. `bun run build`
+2. `bun run test`
+3. Manual: `node packages/repo-mcp/dist/bin/repo-mcp.js` then send:
+
+   * `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+   * `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"repo.graphBuild","arguments":{}}}`
+
+---
+
+If you’re happy, next up is **PR 5**: the agent prompt assembly + stable prefix, plus the “ask for spans, not whole files” behavior so OpenAI’s caching really kicks in.
+

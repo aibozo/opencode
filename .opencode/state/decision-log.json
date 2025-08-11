@@ -1,0 +1,15 @@
+{
+  "entries": [
+    {
+      "ts": "2025-08-11T02:57:34.148Z",
+      "why": "fix add()",
+      "what": "src/mathy.ts"
+    },
+    {
+      "ts": "2025-08-11T02:57:34.148Z",
+      "why": "adjust test",
+      "what": "test/mathy.test.ts",
+      "next": "re-run"
+    }
+  ]
+}

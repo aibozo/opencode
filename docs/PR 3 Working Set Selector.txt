@@ -1,0 +1,498 @@
+
+# PR 3 — Working-Set Selector (budgeted Context Packs)
+
+## Objectives
+
+* Given a **task** (stack trace, filenames, free text), select a **minimal-but-complete** working set:
+
+  * **FULL**: precise line ranges for edit targets + failing tests.
+  * **SKELETON**: neighbors (callers/callees/importers) with elided bodies (from PR 2).
+  * **INTERFACES**: small type/const files verbatim when cheap.
+  * **NOTES**: a compact, *extractive* NL summary of the failure/intent (stub here; full compressor lands in PR 6).
+* Fit within a **token budget** (default 64k) using a simple, deterministic scorer.
+* Expose a clean API for PR 4’s MCP tool.
+
+---
+
+## New/Changed Files
+
+```
+packages/repo-index/
+  src/
+    working-set.ts          # main selector
+    tokenize.ts             # token estimator (OpenAI-ish)
+    stacktrace.ts           # parse Python/Jest/Node traces
+    search.ts               # simple in-repo grep
+  __tests__/
+    working-set-select.test.ts
+    working-set-budget.test.ts
+    working-set-deterministic.test.ts
+    working-set-coverage.test.ts
+fixtures/
+  py-mini/
+    ISSUE.md                # failing trace + NL
+  ts-mini/
+    ISSUE.md
+```
+
+### `packages/repo-index/src/tokenize.ts`
+
+```ts
+// Lightweight token estimator geared for GPT-style BPE.
+// Heuristic fallback keeps us dependency-light; can swap to @dqbd/tiktoken later.
+export interface Tokenizer {
+  estimateTokens(text: string): number;
+}
+
+const AVG_CHARS_PER_TOKEN = 4; // conservative-ish for code+NL
+export const HeuristicTokenizer: Tokenizer = {
+  estimateTokens(text: string) {
+    // count code symbols heavier to avoid underestimating
+    const punct = (text.match(/[{}()[\].,;:+\-*/=<>]/g) ?? []).length;
+    const base = Math.ceil(text.length / AVG_CHARS_PER_TOKEN);
+    return base + Math.ceil(punct / 3);
+  }
+};
+```
+
+> If you want real BPE later: add `@dqbd/tiktoken` and a `TiktokenTokenizer` with WASM init + fallback to heuristic if init fails.
+
+---
+
+### `packages/repo-index/src/stacktrace.ts`
+
+```ts
+export interface StackHit { path: string; line?: number; col?: number; score: number; kind: "py"|"js"|"jest"|"generic"; }
+
+// Extract file/line hints from Python, Node/JS, and Jest-style traces.
+export function extractStackHits(text: string): StackHit[] {
+  const hits: StackHit[] = [];
+
+  // Python: File "/x/y/foo.py", line 123, in func
+  const py = [...text.matchAll(/File "([^"]+\.py)", line (\d+)/g)];
+  for (const m of py) hits.push({ path: m[1], line: +m[2], score: 3, kind: "py" });
+
+  // Node/JS: at /x/y/foo.ts:123:45 or (file:///x/y/foo.js:77:12)
+  const js = [...text.matchAll(/(?:at |\()?(?:file:\/\/)?([^\s)]+?\.(?:[tj]s)x?):(\d+)(?::(\d+))?/g)];
+  for (const m of js) hits.push({ path: m[1], line: +m[2], col: m[3] ? +m[3] : undefined, score: 3, kind: "js" });
+
+  // Jest:  ● Test suite failed to run at src/foo.ts:55:10
+  const jest = [...text.matchAll(/at ([^:\s]+?\.(?:[tj]s)x?):(\d+)(?::(\d+))?/g)];
+  for (const m of jest) hits.push({ path: m[1], line: +m[2], col: m[3] ? +m[3] : undefined, score: 2, kind: "jest" });
+
+  // Generic filenames from messages: foo.py / foo.ts
+  const generic = [...text.matchAll(/([A-Za-z0-9_./-]+\.(?:py|t[sj]s)x?)/g)];
+  for (const m of generic) hits.push({ path: m[1], score: 1, kind: "generic" });
+
+  // Deduplicate while preserving highest score
+  const map = new Map<string, StackHit>();
+  for (const h of hits) {
+    const k = `${h.path}:${h.line ?? 0}`;
+    const prev = map.get(k);
+    if (!prev || h.score > prev.score) map.set(k, h);
+  }
+  return [...map.values()];
+}
+```
+
+---
+
+### `packages/repo-index/src/search.ts`
+
+```ts
+import { readFileSync } from "fs";
+import { resolve } from "path";
+
+export interface GrepHit { path: string; line: number; text: string; score: number; }
+
+// Very simple in-memory grep over candidate files.
+export function grepKeywords(root: string, files: string[], keywords: string[], maxPerFile = 5): GrepHit[] {
+  const out: GrepHit[] = [];
+  const needles = keywords.filter(Boolean).map(k => k.toLowerCase());
+  for (const f of files) {
+    const lines = readFileSync(f, "utf8").split(/\r?\n/);
+    let count = 0;
+    for (let i = 0; i < lines.length && count < maxPerFile; i++) {
+      const L = lines[i].toLowerCase();
+      const hit = needles.some(n => L.includes(n));
+      if (hit) {
+        out.push({ path: f, line: i + 1, text: lines[i].slice(0, 200), score: 1 });
+        count++;
+      }
+    }
+  }
+  return out;
+}
+
+export function keywordsFromTask(task: string): string[] {
+  // capture likely symbol names, error names, and quoted tokens
+  const quoted = [...task.matchAll(/["'`](.{2,64}?)[ "'`]/g)].map(m => m[1]);
+  const camel = [...task.matchAll(/\b[A-Za-z_][A-Za-z0-9_]{2,}\b/g)].map(m => m[0]);
+  return [...new Set([...quoted, ...camel])].slice(0, 50);
+}
+```
+
+---
+
+### `packages/repo-index/src/working-set.ts`
+
+```ts
+import { readFileSync } from "fs";
+import { relative, resolve } from "path";
+import type { ContextPack } from "@opencode/shared/src/types";
+import type { RepoIndex } from "./types";
+import { getIndex } from "./index";
+import { extractStackHits } from "./stacktrace";
+import { keywordsFromTask, grepKeywords } from "./search";
+import { skeletonizeFile } from "./skeleton";
+import { HeuristicTokenizer } from "./tokenize";
+
+// heuristics
+const TEST_PAT = /(test[s]?\/|^tests\/|_test\.|^test_)/i;
+
+export interface SelectOptions {
+  task: string;               // NL: prompt, issue text, stack traces
+  budgetTokens?: number;      // default 64k
+  radius?: 1|2;               // neighbor hops
+  preferSpanContext?: boolean;// if true, trim full files to windows around hints
+  windowLines?: number;       // default 60
+}
+
+export interface SelectionDebug {
+  scoreTable: Array<{ path: string; score: number; reasons: string[] }>;
+  tokens: { target: number; used: number; headroom: number };
+}
+
+export interface WorkingSetResult {
+  pack: ContextPack;
+  debug: SelectionDebug;
+}
+
+export async function selectWorkingSet(root: string, opts: SelectOptions): Promise<WorkingSetResult> {
+  const idx: RepoIndex = getIndex();
+  const budget = opts.budgetTokens ?? 64000;
+  const radius = opts.radius ?? 1;
+  const preferSpan = opts.preferSpanContext ?? true;
+  const windowLines = opts.windowLines ?? 60;
+  const tok = HeuristicTokenizer;
+
+  // 1) Locus from stacks + keywords
+  const stacks = extractStackHits(opts.task);
+  const allFiles = idx.files;
+  const keywords = keywordsFromTask(opts.task);
+  const grep = grepKeywords(root, allFiles, keywords);
+
+  // 2) Score files
+  const table = new Map<string, { score: number; reasons: string[] }>();
+  function bump(p: string, s: number, r: string) {
+    const abs = resolve(p);
+    const rel = relative(root, abs);
+    const v = table.get(rel) ?? { score: 0, reasons: [] };
+    v.score += s; v.reasons.push(r); table.set(rel, v);
+  }
+
+  for (const h of stacks) bump(resolve(root, h.path), 8, `stack:${h.kind}`);
+  for (const g of grep) bump(g.path, 2, "grep");
+
+  // tests first-class citizens
+  for (const f of allFiles) if (TEST_PAT.test(f)) bump(f, 3, "test");
+
+  // 3) Graph proximity: 1 or 2 hops
+  // Map file -> symbols to find neighbors by edges; then map back to files.
+  const symByFile = new Map<string, string[]>();
+  for (const s of idx.symbols) {
+    const rel = relative(root, s.file).replace(/\\/g, "/");
+    if (!symByFile.has(rel)) symByFile.set(rel, []);
+    symByFile.get(rel)!.push(s.name);
+  }
+  const fileBySym = new Map<string, string>();
+  for (const [f, syms] of symByFile) for (const s of syms) fileBySym.set(s, f);
+
+  function neighbors(files: Set<string>, hops: number): Set<string> {
+    let frontier = new Set(files);
+    const seen = new Set(files);
+    for (let i = 0; i < hops; i++) {
+      const next = new Set<string>();
+      for (const f of frontier) {
+        const syms = symByFile.get(f) ?? [];
+        for (const e of idx.edges) {
+          if (syms.includes(e.from)) {
+            const nf = fileBySym.get(e.to);
+            if (nf && !seen.has(nf)) { seen.add(nf); next.add(nf); }
+          }
+        }
+      }
+      frontier = next;
+    }
+    return seen;
+  }
+
+  const seedFiles = new Set<string>([...table.keys()]);
+  const withNeighbors = neighbors(seedFiles, radius);
+  for (const nf of withNeighbors) if (!table.has(nf)) bump(nf, 1, `neighbor:${radius}h`);
+
+  // 4) Rank files by score then by locality (same dirs as seeds)
+  const seedDirs = [...seedFiles].map(f => relative(root, resolve(root, f)).split(/[\\/]/).slice(0, -1).join("/"));
+  const ranked = [...table.entries()].sort((a, b) => b[1].score - a[1].score);
+
+  // 5) Compose Context Pack with budgeting
+  const pack: ContextPack = { full: [], skeletons: [], interfaces: [], search_hits: [], notes: "", budget: { target: budget } };
+  let used = 0;
+
+  // Helper: estimate tokens if we include a section
+  function tokensForText(text: string) { return tok.estimateTokens(text); }
+
+  // Always include NOTES (stub extractive: keep top 30 lines around stack frames/keywords)
+  const lines = opts.task.split(/\r?\n/).slice(0, 300);
+  const brief = lines.filter(l => /File | at |Error|Exception|assert|expected|received|Traceback/.test(l) || /[A-Za-z_]{3,}/.test(l)).slice(0, 30).join("\n");
+  pack.notes = brief;
+  used += tokensForText(brief);
+
+  // Pick FULL files/ranges: stack hits (span windows) + all tests
+  const addedFull = new Set<string>();
+  function addFullSpan(absPath: string, hintLine?: number) {
+    const rel = relative(root, absPath).replace(/\\/g, "/");
+    if (addedFull.has(rel)) return;
+    const isTest = TEST_PAT.test(absPath);
+    const ranges = (preferSpan && !isTest && hintLine)
+      ? [[Math.max(1, hintLine - windowLines), hintLine + windowLines] as [number, number]]
+      : undefined; // whole file later if we want—but start with ranges to save tokens
+    pack.full.push({ path: rel, ranges });
+    addedFull.add(rel);
+  }
+
+  for (const h of stacks) {
+    const abs = resolve(root, h.path);
+    addFullSpan(abs, h.line);
+  }
+  for (const f of allFiles.filter(f => TEST_PAT.test(f))) addFullSpan(f);
+
+  // Account tokens for FULL (rough: count lines in ranges, else whole file)
+  function fileSliceText(absPath: string, ranges?: [number, number][]) {
+    const content = readFileSync(absPath, "utf8");
+    if (!ranges || !ranges.length) return content;
+    const lines = content.split(/\r?\n/);
+    const chunks = ranges.map(([a,b]) => lines.slice(a-1, Math.min(b, lines.length)).join("\n"));
+    return chunks.join("\n...\n");
+    }
+  for (const f of pack.full) {
+    const abs = resolve(root, f.path);
+    used += tokensForText(fileSliceText(abs, f.ranges));
+  }
+
+  // Add SKELETON neighbors in score order until near budget
+  for (const [rel, meta] of ranked) {
+    if (addedFull.has(rel)) continue;
+    const abs = resolve(root, rel);
+    const sk = skeletonizeFile(root, abs);
+    const t = tokensForText(sk.text);
+    if (used + t > budget) continue;
+    pack.skeletons.push({ path: rel, hash: sk.elisions.map(e => e.sha1).join(",") });
+    used += t;
+  }
+
+  // Interfaces: tiny files (< 200 tokens) that look like types/constants
+  for (const rel of allFiles.map(p => relative(root, p).replace(/\\/g, "/"))) {
+    if (addedFull.has(rel) || pack.skeletons.find(s => s.path === rel)) continue;
+    const content = readFileSync(resolve(root, rel), "utf8");
+    if (/interface|type\s+\w+|enum|const\s+\w+\s*=/.test(content)) {
+      const t = tokensForText(content);
+      if (t < 200 && used + t <= budget) {
+        pack.interfaces.push({ path: rel });
+        used += t;
+      }
+    }
+  }
+
+  // Attach search hits (trim to top 40)
+  pack.search_hits = grep.slice(0, 40).map(h => ({ path: relative(root, h.path).replace(/\\/g, "/"), line: h.line, text: h.text }));
+
+  const debug = {
+    scoreTable: [...table.entries()].map(([path, v]) => ({ path, score: v.score, reasons: v.reasons })),
+    tokens: { target: budget, used, headroom: Math.max(0, budget - used) }
+  };
+
+  pack.budget = { target: budget, used };
+
+  return { pack, debug };
+}
+```
+
+---
+
+## Tests
+
+### `packages/repo-index/__tests__/working-set-select.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { resolve } from "path";
+import { buildIndex } from "../src/index";
+import { selectWorkingSet } from "../src/working-set";
+import { readFileSync } from "fs";
+
+describe("working set basic selection", async () => {
+  it("includes stack-hit files as FULL and neighbors as SKELETON", async () => {
+    const pyRoot = resolve("fixtures/py-mini");
+    await buildIndex(pyRoot);
+    const issue = readFileSync(resolve(pyRoot, "ISSUE.md"), "utf8");
+    const { pack } = await selectWorkingSet(pyRoot, { task: issue, budgetTokens: 8000, radius: 1 });
+    const fullPaths = pack.full.map(f => f.path);
+    expect(fullPaths.some(p => p.endsWith("pkg/mathy.py"))).toBe(true);
+    expect(pack.skeletons.length).toBeGreaterThanOrEqual(0);
+    // tests included
+    expect(fullPaths.some(p => /tests\/test_mathy\.py$/.test(p))).toBe(true);
+  });
+});
+```
+
+### `packages/repo-index/__tests__/working-set-budget.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { resolve } from "path";
+import { buildIndex } from "../src/index";
+import { selectWorkingSet } from "../src/working-set";
+import { readFileSync } from "fs";
+
+describe("respects token budget", async () => {
+  it("keeps used <= target", async () => {
+    const tsRoot = resolve("fixtures/ts-mini");
+    await buildIndex(tsRoot);
+    const issue = readFileSync(resolve(tsRoot, "ISSUE.md"), "utf8");
+    const { pack, debug } = await selectWorkingSet(tsRoot, { task: issue, budgetTokens: 1500, radius: 1 });
+    expect(debug.tokens.used).toBeLessThanOrEqual(debug.tokens.target);
+  });
+});
+```
+
+### `packages/repo-index/__tests__/working-set-deterministic.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { resolve } from "path";
+import { buildIndex } from "../src/index";
+import { selectWorkingSet } from "../src/working-set";
+
+function sig(pack: any) {
+  return JSON.stringify({
+    full: pack.full.map((f: any) => [f.path, f.ranges]),
+    sk: pack.skeletons.map((s: any) => s.path),
+    ifc: pack.interfaces.map((i: any) => i.path),
+    notes: pack.notes.slice(0, 120)
+  });
+}
+
+describe("deterministic selection", async () => {
+  it("produces same pack for same inputs", async () => {
+    const root = resolve("fixtures/py-mini");
+    await buildIndex(root);
+    const task = "Traceback: File \"pkg/mathy.py\", line 5, in add";
+    const a = await selectWorkingSet(root, { task, budgetTokens: 4000, radius: 1 });
+    const b = await selectWorkingSet(root, { task, budgetTokens: 4000, radius: 1 });
+    expect(sig(a.pack)).toEqual(sig(b.pack));
+  });
+});
+```
+
+### `packages/repo-index/__tests__/working-set-coverage.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { resolve } from "path";
+import { buildIndex } from "../src/index";
+import { selectWorkingSet } from "../src/working-set";
+
+describe("coverage: neighbors appear as skeletons", async () => {
+  it("adds 1-hop neighbors for seed files", async () => {
+    const root = resolve("fixtures/ts-mini");
+    await buildIndex(root);
+    const task = "TypeError in add at src/mathy.ts:3:10";
+    const { pack } = await selectWorkingSet(root, { task, budgetTokens: 8000, radius: 1 });
+    expect(pack.full.some(f => f.path.endsWith("src/mathy.ts"))).toBe(true);
+    // index.ts exports from mathy -> should be neighbor candidate
+    expect(pack.skeletons.some(s => s.path.endsWith("src/index.ts"))).toBe(true);
+  });
+});
+```
+
+---
+
+## Fixtures (update)
+
+### `fixtures/py-mini/ISSUE.md`
+
+```md
+### Bug
+Accumulator.add returns wrong value in edge case.
+
+### Traceback
+Traceback (most recent call last):
+  File "pkg/mathy.py", line 10, in add
+    return a + b
+AssertionError: expected 4, received 5
+```
+
+### `fixtures/ts-mini/ISSUE.md`
+
+```md
+### Bug
+Accumulator.add misbehaves when initial value is not zero.
+
+### Jest
+TypeError: Cannot read properties of undefined (reading 'add')
+  at src/mathy.ts:6:15
+  at test/mathy.test.ts:3:10
+```
+
+---
+
+## Acceptance Criteria (PR 3)
+
+* `bun run build && bun run test` passes (new tests green).
+* `selectWorkingSet(root, { task, budgetTokens, radius })` returns:
+
+  * `pack.notes` populated with a short extract from the task text.
+  * `pack.full` includes stack-hit files as *spans* (±`windowLines`) and **all tests** as full (ranges `undefined`).
+  * `pack.skeletons` includes score-ordered neighbors until the budget is nearly filled.
+  * `pack.interfaces` includes tiny type/const files when cheap.
+  * `pack.budget.used <= pack.budget.target`.
+* Deterministic: repeated calls with same inputs yield same pack (order-insensitive equality).
+
+---
+
+## Implementation Notes / Guardrails
+
+* **Span vs whole file:** For non-test targets with line hints, we include ±`windowLines` lines. This saves tokens *massively*. The agent can always request the rest via `readSpan` later (PR 4/5).
+* **Neighbors:** 1-hop by default. If a selected file contains many `type/interface` defs, we’ll bump to 2 hops in PR 5 when the agent detects type errors post-edit.
+* **Scoring is simple on purpose:** stacks (8) > tests (3) > grep (2) > neighbors (1). Deterministic and cheap to compute.
+* **Token estimator:** heuristic for now; we’ll slot a proper BPE in PR 6/7 without changing the API.
+* **No MCP wiring yet:** this is *library only*. PR 4 exposes `repo.workingSet.select` over MCP.
+
+---
+
+## PR Description (pasteable)
+
+**Title:** PR 3 — Working-Set Selector: budgeted Context Packs with spans, neighbors, and notes
+
+**Summary:**
+Adds a deterministic selection module that builds a token-budgeted Context Pack per task. It identifies edit targets from stack traces and keywords, includes failing tests, adds graph neighbors as skeletons, and ensures the result fits under a configurable token budget. Includes a lightweight token estimator, stack trace and grep utilities, and comprehensive tests (selection, budget, determinism, coverage).
+
+**How to test:**
+
+1. `bun run build`
+2. `bun run test`
+3. (Optional) from a REPL:
+
+```ts
+import { buildIndex } from "packages/repo-index/src/index";
+import { selectWorkingSet } from "packages/repo-index/src/working-set";
+await buildIndex("fixtures/ts-mini");
+const { pack, debug } = await selectWorkingSet("fixtures/ts-mini", { task: await fs.readFile("fixtures/ts-mini/ISSUE.md","utf8"), budgetTokens: 4000, radius: 1 });
+console.log(pack, debug);
+```
+
+---
+
+If you give me the go-ahead, I’ll queue **PR 4** to expose this over MCP (`repo.workingSet.select`) plus `code.readSpan` and `code.skeleton` so the agent can actually *use* the pack in OpenCode.
+

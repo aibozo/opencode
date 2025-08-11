@@ -1,0 +1,744 @@
+
+# PR 1 — Tree-sitter Indexer (automatic + incremental)
+
+## Objectives
+
+* Parse **Python** and **TS/JS** to produce a repo index:
+
+  * files, symbols (defs), docstrings/JSDoc, line ranges
+  * import/export edges
+  * best-effort call edges
+* Run **incrementally** via a watcher.
+* Keep a clean API that later PRs (skeletonizer + working set selector) can call.
+* Wire the MCP stub to call the real indexer and return counts.
+
+> **Runtime note:** we’ll use **node-tree-sitter** (native). To avoid Bun/native quirks, the MCP server will run with **Node 20+** (we keep Bun for package mgmt if you like).
+
+---
+
+## Changes at a glance
+
+* Add dependencies: `node-tree-sitter`, `tree-sitter-python`, `tree-sitter-javascript`, `tree-sitter-typescript`, `fast-glob`, `chokidar`.
+* Implement language drivers for py/ts/js.
+* Implement `buildIndex`, `updateIndex`, `startWatcher`.
+* Update MCP server to call `buildIndex` and return a summary.
+* Add fixtures (`py-mini`, `ts-mini`) and tests for symbol extraction, edges, and determinism.
+* Update scripts/opencode config to run MCP with Node.
+
+---
+
+## package updates
+
+### Root `package.json` (add deps + script tweaks)
+
+```json
+{
+  "scripts": {
+    "dev:repo-mcp": "node packages/repo-mcp/dist/bin/repo-mcp.js",
+    "build": "bun run --cwd packages/repo-index build && bun run --cwd packages/repo-mcp build",
+    "test": "vitest run"
+  }
+}
+```
+
+### `.opencode/opencode.json` (switch MCP command to Node dist)
+
+```json
+{
+  "mcp": {
+    "repo-graph": {
+      "type": "local",
+      "command": ["node", "packages/repo-mcp/dist/bin/repo-mcp.js"],
+      "enabled": true
+    }
+  }
+}
+```
+
+### `packages/repo-index/package.json` (deps)
+
+```json
+{
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "fast-glob": "^3.3.2",
+    "node-tree-sitter": "^0.21.1",
+    "tree-sitter-javascript": "^0.20.3",
+    "tree-sitter-python": "^0.20.4",
+    "tree-sitter-typescript": "^0.20.3"
+  }
+}
+```
+
+---
+
+## repo-index: new/updated files
+
+### `packages/repo-index/src/types.ts` (extend types)
+
+```ts
+import type { FilePath } from "@opencode/shared/src/types";
+
+export type Lang = "python" | "javascript" | "typescript";
+
+export interface SymbolInfo {
+  file: FilePath;
+  lang: Lang;
+  name: string;                 // fully-scoped: pkg.mod:Class.method or file-local fn
+  shortName: string;            // method | function | class name
+  kind: "func" | "method" | "class" | "const" | "type" | "var" | "module";
+  startLine: number;
+  endLine: number;
+  doc?: string;                 // docstring/JSDoc (raw)
+  export?: boolean;             // TS/JS: exported symbol
+}
+
+export interface Edge {
+  from: string;                 // name (fully-scoped)
+  to: string;                   // name (fully-scoped) or module path
+  type: "calls" | "imports" | "exports";
+}
+
+export interface RepoIndex {
+  root: string;
+  files: FilePath[];
+  symbols: SymbolInfo[];
+  edges: Edge[];
+  updatedAt: number;
+}
+
+export interface BuildOptions {
+  include?: string[];           // globs (default: **/*.{py,ts,tsx,js,jsx})
+  exclude?: string[];           // default: node_modules, dist, .git, build
+}
+```
+
+### `packages/repo-index/src/lang/python.ts`
+
+```ts
+import Parser from "node-tree-sitter";
+import Python from "tree-sitter-python";
+import { readFileSync } from "fs";
+import { relative } from "path";
+import type { SymbolInfo, Edge } from "../types";
+
+const parser = new Parser();
+parser.setLanguage(Python);
+
+export function detectPyModuleName(root: string, file: string): string {
+  // repo-relative, strip .py, convert / to .
+  const rel = relative(root, file).replace(/\\/g, "/");
+  return rel.replace(/\.py$/, "").replace(/\//g, ".");
+}
+
+export function parsePython(root: string, file: string): {
+  symbols: SymbolInfo[],
+  edges: Edge[]
+} {
+  const src = readFileSync(file, "utf8");
+  const tree = parser.parse(src);
+
+  const symbols: SymbolInfo[] = [];
+  const edges: Edge[] = [];
+  const moduleName = detectPyModuleName(root, file);
+
+  function lineOf(node: any) { return node.startPosition.row + 1; }
+
+  function docstringFor(node: any): string | undefined {
+    // Look for a first-statement string literal (expr_stmt -> string)
+    const suite = node?.namedChildren?.find((n: any) => n.type === "block" || n.type === "suite") ?? node;
+    if (!suite) return;
+    const first = suite.namedChildren?.find((n: any) => n.type === "expression_statement");
+    const str = first?.namedChildren?.[0];
+    if (str && (str.type === "string" || str.type === "string_literal")) {
+      return src.slice(str.startIndex, str.endIndex);
+    }
+  }
+
+  function scopedName(parts: string[]) {
+    return `${moduleName}:${parts.filter(Boolean).join(".")}`;
+  }
+
+  function walk(node: any, classCtx?: string) {
+    if (node.type === "function_definition") {
+      const name = node.childForFieldName("name")?.text ?? "anonymous";
+      const start = lineOf(node);
+      const end = node.endPosition.row + 1;
+      const kind = classCtx ? "method" : "func";
+      const doc = docstringFor(node);
+      const full = scopedName([classCtx, name]);
+      symbols.push({
+        file, lang: "python", name: full, shortName: name, kind, startLine: start, endLine: end, doc
+      });
+      // best-effort call edges: any identifier inside body
+      const body = node.childForFieldName("body");
+      body?.descendantsOfType?.(["identifier"])?.forEach((id: any) => {
+        edges.push({ from: full, to: id.text, type: "calls" });
+      });
+      return; // still descend? we can skip, or continue to find nested defs
+    }
+
+    if (node.type === "class_definition") {
+      const name = node.childForFieldName("name")?.text ?? "AnonClass";
+      const start = lineOf(node);
+      const end = node.endPosition.row + 1;
+      const doc = docstringFor(node);
+      const full = scopedName([name]);
+      symbols.push({
+        file, lang: "python", name: full, shortName: name, kind: "class", startLine: start, endLine: end, doc
+      });
+      // walk class body for methods
+      node.namedChildren?.forEach((ch: any) => walk(ch, name));
+      return;
+    }
+
+    if (node.type === "import_statement" || node.type === "import_from_statement") {
+      // crude: edge to module name text
+      edges.push({ from: scopedName([]), to: node.text, type: "imports" });
+    }
+
+    node.namedChildren?.forEach((ch: any) => walk(ch, classCtx));
+  }
+
+  walk(tree.rootNode);
+  // Add module symbol
+  symbols.push({
+    file, lang: "python", name: scopedName([]), shortName: moduleName, kind: "module",
+    startLine: 1, endLine: tree.rootNode.endPosition.row + 1
+  });
+
+  return { symbols, edges };
+}
+```
+
+### `packages/repo-index/src/lang/javascript.ts`
+
+```ts
+import Parser from "node-tree-sitter";
+import JavaScript from "tree-sitter-javascript";
+import { readFileSync } from "fs";
+import { extname, relative } from "path";
+import type { SymbolInfo, Edge } from "../types";
+
+const parser = new Parser();
+parser.setLanguage(JavaScript);
+
+function detectModuleName(root: string, file: string): string {
+  const rel = relative(root, file).replace(/\\/g, "/");
+  return rel.replace(/\.(mjs|cjs|js|jsx)$/, "").replace(/\//g, ".");
+}
+
+export function parseJavaScript(root: string, file: string): { symbols: SymbolInfo[], edges: Edge[] } {
+  const src = readFileSync(file, "utf8");
+  const tree = parser.parse(src);
+
+  const symbols: SymbolInfo[] = [];
+  const edges: Edge[] = [];
+  const moduleName = detectModuleName(root, file);
+
+  function lineOf(node: any) { return node.startPosition.row + 1; }
+  function scopedName(parts: string[]) {
+    return `${moduleName}:${parts.filter(Boolean).join(".")}`;
+  }
+
+  function jsdocFor(node: any): string | undefined {
+    // naïve: look at leading comments
+    const comments = node?.commentsBefore?.(); // not standard; fallback below
+    if (comments?.length) return comments[comments.length - 1]?.text;
+    return undefined;
+  }
+
+  function exportFlag(node: any): boolean {
+    // if parent is export_declaration or node has "export" modifier
+    let n = node;
+    while (n) {
+      if (n.type === "export_statement" || n.type === "export_clause" || n.type === "export_declaration") return true;
+      n = n.parent;
+    }
+    return false;
+  }
+
+  function walk(node: any, classCtx?: string) {
+    if (node.type === "function_declaration") {
+      const name = node.childForFieldName("name")?.text ?? "anonymous";
+      const full = scopedName([classCtx, name]);
+      symbols.push({
+        file, lang: "javascript", name: full, shortName: name, kind: classCtx ? "method" : "func",
+        startLine: lineOf(node), endLine: node.endPosition.row + 1, doc: jsdocFor(node), export: exportFlag(node)
+      });
+      // best-effort calls
+      node.descendantsOfType?.(["identifier"])?.forEach((id: any) => {
+        edges.push({ from: full, to: id.text, type: "calls" });
+      });
+      return;
+    }
+
+    if (node.type === "class_declaration") {
+      const name = node.childForFieldName("name")?.text ?? "AnonClass";
+      const full = scopedName([name]);
+      symbols.push({
+        file, lang: "javascript", name: full, shortName: name, kind: "class",
+        startLine: lineOf(node), endLine: node.endPosition.row + 1, doc: jsdocFor(node), export: exportFlag(node)
+      });
+      node.namedChildren?.forEach((ch: any) => walk(ch, name));
+      return;
+    }
+
+    if (node.type.includes("import")) {
+      edges.push({ from: scopedName([]), to: node.text, type: "imports" });
+    }
+    if (node.type.includes("export")) {
+      // file-level export edge (summary)
+      edges.push({ from: scopedName([]), to: "exports", type: "exports" });
+    }
+
+    node.namedChildren?.forEach((ch: any) => walk(ch, classCtx));
+  }
+
+  walk(tree.rootNode);
+
+  const lang: "javascript" | "typescript" =
+    [".ts", ".tsx"].includes(extname(file)) ? "typescript" : "javascript";
+
+  symbols.push({
+    file, lang, name: scopedName([]), shortName: moduleName, kind: "module",
+    startLine: 1, endLine: tree.rootNode.endPosition.row + 1
+  });
+
+  return { symbols, edges };
+}
+```
+
+### `packages/repo-index/src/lang/typescript.ts`
+
+```ts
+import Parser from "node-tree-sitter";
+import TypeScript from "tree-sitter-typescript";
+const TSX = TypeScript.tsx;
+
+import { readFileSync } from "fs";
+import { relative } from "path";
+import type { SymbolInfo, Edge } from "../types";
+
+const parser = new Parser();
+parser.setLanguage(TypeScript.typescript);
+
+export function detectTsModuleName(root: string, file: string): string {
+  const rel = relative(root, file).replace(/\\/g, "/");
+  return rel.replace(/\.(ts|tsx)$/, "").replace(/\//g, ".");
+}
+
+export function parseTypeScript(root: string, file: string): { symbols: SymbolInfo[], edges: Edge[] } {
+  const src = readFileSync(file, "utf8");
+  const tree = parser.parse(src);
+
+  const symbols: SymbolInfo[] = [];
+  const edges: Edge[] = [];
+  const moduleName = detectTsModuleName(root, file);
+  function lineOf(node: any) { return node.startPosition.row + 1; }
+  function scopedName(parts: string[]) { return `${moduleName}:${parts.filter(Boolean).join(".")}`; }
+
+  function jsdocFor(_node: any): string | undefined { return undefined; /* TODO: leading comment capture */ }
+  function exportFlag(node: any): boolean {
+    let n = node;
+    while (n) { if (n.type.includes("export")) return true; n = n.parent; }
+    return false;
+  }
+
+  function walk(node: any, classCtx?: string) {
+    if (node.type === "function_declaration" || node.type === "method_definition") {
+      const id = node.childForFieldName("name") ?? node.child(1);
+      const name = id?.text ?? "anonymous";
+      const full = scopedName([classCtx, name]);
+      symbols.push({
+        file, lang: "typescript", name: full, shortName: name,
+        kind: node.type === "method_definition" ? "method" : "func",
+        startLine: lineOf(node), endLine: node.endPosition.row + 1,
+        doc: jsdocFor(node), export: exportFlag(node)
+      });
+      node.descendantsOfType?.(["identifier"])?.forEach((id: any) => {
+        edges.push({ from: full, to: id.text, type: "calls" });
+      });
+      return;
+    }
+    if (node.type === "class_declaration" || node.type === "interface_declaration" || node.type === "type_alias_declaration") {
+      const name = node.childForFieldName("name")?.text ?? "Anon";
+      const kind = node.type === "class_declaration" ? "class" : "type";
+      const full = scopedName([name]);
+      symbols.push({
+        file, lang: "typescript", name: full, shortName: name, kind,
+        startLine: lineOf(node), endLine: node.endPosition.row + 1, doc: jsdocFor(node), export: exportFlag(node)
+      });
+      node.namedChildren?.forEach((ch: any) => walk(ch, name));
+      return;
+    }
+    if (node.type.includes("import")) edges.push({ from: scopedName([]), to: node.text, type: "imports" });
+    if (node.type.includes("export")) edges.push({ from: scopedName([]), to: "exports", type: "exports" });
+
+    node.namedChildren?.forEach((ch: any) => walk(ch, classCtx));
+  }
+
+  walk(tree.rootNode);
+
+  symbols.push({
+    file, lang: "typescript", name: scopedName([]), shortName: moduleName, kind: "module",
+    startLine: 1, endLine: tree.rootNode.endPosition.row + 1
+  });
+
+  return { symbols, edges };
+}
+```
+
+### `packages/repo-index/src/index.ts` (implement scanning + orchestration)
+
+```ts
+import fg from "fast-glob";
+import { resolve } from "path";
+import { parsePython } from "./lang/python";
+import { parseJavaScript } from "./lang/javascript";
+import { parseTypeScript } from "./lang/typescript";
+import type { BuildOptions, Lang, RepoIndex, SymbolInfo, Edge } from "./types";
+import { startWatcher } from "./watcher";
+
+let CURRENT_INDEX: RepoIndex = { root: "", files: [], symbols: [], edges: [], updatedAt: 0 };
+
+function langOf(path: string): Lang | undefined {
+  if (/\.(py)$/.test(path)) return "python";
+  if (/\.(ts|tsx)$/.test(path)) return "typescript";
+  if (/\.(js|jsx|mjs|cjs)$/.test(path)) return "javascript";
+  return undefined;
+}
+
+export async function buildIndex(root: string, opts: BuildOptions = {}): Promise<RepoIndex> {
+  const include = opts.include ?? ["**/*.{py,ts,tsx,js,jsx}"];
+  const exclude = opts.exclude ?? ["**/node_modules/**", "**/dist/**", "**/build/**", "**/.git/**"];
+  const files = await fg(include, { cwd: root, ignore: exclude, absolute: true });
+
+  const symbols: SymbolInfo[] = [];
+  const edges: Edge[] = [];
+  for (const file of files) {
+    const lang = langOf(file);
+    if (!lang) continue;
+    if (lang === "python") {
+      const { symbols: ss, edges: es } = parsePython(root, file);
+      symbols.push(...ss); edges.push(...es);
+    } else if (lang === "typescript") {
+      const { symbols: ss, edges: es } = parseTypeScript(root, file);
+      symbols.push(...ss); edges.push(...es);
+    } else if (lang === "javascript") {
+      const { symbols: ss, edges: es } = parseJavaScript(root, file);
+      symbols.push(...ss); edges.push(...es);
+    }
+  }
+  CURRENT_INDEX = { root: resolve(root), files, symbols, edges, updatedAt: Date.now() };
+  return CURRENT_INDEX;
+}
+
+export async function updateIndex(_changedPaths: string[]): Promise<RepoIndex> {
+  // PR 1: keep it simple — rebuild. PR 2 will do per-file incremental.
+  return CURRENT_INDEX.root ? buildIndex(CURRENT_INDEX.root) : CURRENT_INDEX;
+}
+
+export function getIndex(): RepoIndex { return CURRENT_INDEX; }
+
+export function ensureWatcher(root: string) {
+  startWatcher(root, async () => { await updateIndex([]); });
+}
+```
+
+### `packages/repo-index/src/watcher.ts`
+
+```ts
+import chokidar from "chokidar";
+
+export function startWatcher(root: string, onChange: () => Promise<void>) {
+  const watcher = chokidar.watch(["**/*.{py,ts,tsx,js,jsx}"], {
+    cwd: root,
+    ignored: ["**/node_modules/**", "**/dist/**", "**/build/**", "**/.git/**"],
+    ignoreInitial: true
+  });
+  watcher.on("add", () => onChange());
+  watcher.on("change", () => onChange());
+  watcher.on("unlink", () => onChange());
+  return watcher;
+}
+```
+
+---
+
+## repo-mcp: wire to real index
+
+### `packages/repo-mcp/src/tools.ts`
+
+```ts
+import { buildIndex, getIndex, ensureWatcher } from "@opencode/repo-index/src/index";
+
+export async function handleGraphBuild(params: { root?: string }) {
+  const root = params.root ?? process.cwd();
+  await buildIndex(root);
+  ensureWatcher(root);
+  const idx = getIndex();
+  return {
+    ok: true,
+    updatedAt: idx.updatedAt,
+    files: idx.files.length,
+    symbols: idx.symbols.length,
+    edges: idx.edges.length
+  };
+}
+```
+
+---
+
+## Fixtures
+
+### `fixtures/py-mini/` (files)
+
+```
+py-mini/
+  pkg/
+    __init__.py
+    mathy.py
+    util.py
+  tests/
+    test_mathy.py
+```
+
+**`py-mini/pkg/mathy.py`**
+
+```py
+"""Math helpers."""
+
+def add(a, b):
+    """Add two numbers."""
+    return a + b
+
+class Accumulator:
+    """Simple accumulator."""
+    def __init__(self):
+        self._v = 0
+    def add(self, x):
+        """Add x."""
+        self._v = add(self._v, x)
+        return self._v
+```
+
+**`py-mini/pkg/util.py`**
+
+```py
+def clamp(x, lo, hi):
+    """Clamp x to [lo, hi]."""
+    if x < lo: return lo
+    if x > hi: return hi
+    return x
+```
+
+**`py-mini/tests/test_mathy.py`**
+
+```py
+from pkg.mathy import add, Accumulator
+
+def test_add():
+    assert add(1,2) == 3
+
+def test_acc():
+    acc = Accumulator()
+    assert acc.add(3) == 3
+```
+
+### `fixtures/ts-mini/` (files)
+
+```
+ts-mini/
+  src/
+    mathy.ts
+    index.ts
+  test/
+    mathy.test.ts
+```
+
+**`ts-mini/src/mathy.ts`**
+
+```ts
+/** Math helpers */
+export function add(a: number, b: number) {
+  return a + b;
+}
+export class Accumulator {
+  private v = 0;
+  /** Add x */
+  add(x: number) { this.v = add(this.v, x); return this.v; }
+}
+```
+
+**`ts-mini/src/index.ts`**
+
+```ts
+export * from "./mathy";
+```
+
+**`ts-mini/test/mathy.test.ts`**
+
+```ts
+import { add, Accumulator } from "../src/mathy";
+test("add", () => { expect(add(1,2)).toBe(3); });
+test("acc", () => { const a = new Accumulator(); expect(a.add(3)).toBe(3); });
+```
+
+---
+
+## Tests
+
+### `tests/index-python.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { buildIndex } from "../packages/repo-index/src/index";
+import { resolve } from "path";
+
+describe("python indexing", async () => {
+  const root = resolve("fixtures/py-mini");
+  const idx = await buildIndex(root);
+
+  it("finds files", () => {
+    expect(idx.files.some(f => f.endsWith("pkg/mathy.py"))).toBe(true);
+  });
+
+  it("extracts symbols with lines", () => {
+    const syms = idx.symbols.filter(s => s.file.endsWith("pkg/mathy.py"));
+    const names = syms.map(s => s.name).sort();
+    expect(names).toContain("pkg.mathy:add");
+    expect(names.find(n => n.includes("Accumulator"))).toBeTruthy();
+    const add = syms.find(s => s.shortName === "add" && s.kind === "func");
+    expect(add?.startLine).toBeGreaterThan(1);
+    expect(add?.endLine).toBeGreaterThan(add!.startLine);
+  });
+
+  it("adds import/call edges best-effort", () => {
+    const calls = idx.edges.filter(e => e.type === "calls");
+    expect(calls.some(e => e.to === "add")).toBe(true);
+  });
+});
+```
+
+### `tests/index-ts.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { resolve } from "path";
+import { buildIndex } from "../packages/repo-index/src/index";
+
+describe("ts indexing", async () => {
+  const root = resolve("fixtures/ts-mini");
+  const idx = await buildIndex(root);
+
+  it("extracts exported symbols", () => {
+    const syms = idx.symbols.filter(s => s.file.endsWith("src/mathy.ts"));
+    const add = syms.find(s => s.shortName === "add");
+    const acc = syms.find(s => s.shortName === "Accumulator");
+    expect(add?.export).toBe(true);
+    expect(acc?.export).toBe(true);
+  });
+
+  it("includes module symbols", () => {
+    const mod = idx.symbols.find(s => s.kind === "module" && s.file.endsWith("src/mathy.ts"));
+    expect(mod).toBeTruthy();
+  });
+});
+```
+
+### `tests/index-deterministic.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { resolve } from "path";
+import { buildIndex } from "../packages/repo-index/src/index";
+import crypto from "crypto";
+
+function hash(obj: any) {
+  return crypto.createHash("sha1").update(JSON.stringify(obj)).digest("hex");
+}
+
+describe("deterministic index", async () => {
+  it("is stable across runs", async () => {
+    const idx1 = await buildIndex(resolve("fixtures/py-mini"));
+    const idx2 = await buildIndex(resolve("fixtures/py-mini"));
+    expect(hash(idx1.symbols)).toBe(hash(idx2.symbols));
+    expect(hash(idx1.edges)).toBe(hash(idx2.edges));
+  });
+});
+```
+
+### `tests/mcp-graphbuild.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { spawn } from "child_process";
+import { resolve } from "path";
+
+function send(proc: any, obj: any) {
+  proc.stdin.write(JSON.stringify(obj) + "\n");
+}
+function recv(proc: any): Promise<any> {
+  return new Promise((resolve) => proc.stdout.once("data", (buf: Buffer) => resolve(buf.toString().trim())));
+}
+
+describe("MCP graphBuild integration", () => {
+  it("returns summary counts", async () => {
+    const proc = spawn("node", ["packages/repo-mcp/dist/bin/repo-mcp.js"], { stdio: ["pipe","pipe","pipe"], cwd: process.cwd() });
+    const ready = await recv(proc);
+    expect(ready).toContain("MCP:READY");
+    send(proc, { id: 1, method: "repo.graphBuild", params: { root: resolve("fixtures/ts-mini") } });
+    const resLine = await recv(proc);
+    const res = JSON.parse(resLine);
+    expect(res.result.ok).toBe(true);
+    expect(res.result.files).toBeGreaterThan(0);
+    proc.kill();
+  });
+});
+```
+
+---
+
+## Acceptance criteria (PR 1)
+
+* `bun install` then `bun run build` succeeds.
+* `bun run test` passes all tests.
+* Running OpenCode (`opencode dev`) loads the MCP; calling `repo.graphBuild` returns `{ok:true, files, symbols, edges}`.
+* Index includes module + class/func/method symbols with correct line ranges and docstrings/JSDoc (where present).
+* Best-effort `calls` edges exist (may over-approximate; we’ll refine later).
+* Watcher auto-rebuilds on file changes (manual spot-check acceptable for PR 1).
+
+---
+
+## Notes (implementation guidance for the agent)
+
+* **Docstrings (Python):** first statement string in a def/class block is treated as docstring; store raw literal (quotes included).
+* **JSDoc/TS:** for now, skip fancy comment capture—OK to leave `doc` empty. We’ll improve in PR 2/3.
+* **Symbol scoping:** `module:path:Class.method` format ensures uniqueness and easy grouping.
+* **Imports/exports:** keep simple edges for now by using node text; later we’ll resolve to actual module specifiers.
+* **Incremental:** PR 1 rebuilds on change; true per-file incremental lands in PR 2.
+
+---
+
+## PR description (pasteable)
+
+**Title:** PR 1 — Tree-sitter indexer (Python + TS/JS), watcher, MCP wiring
+
+**Summary:**
+Introduces a repository indexer using node-tree-sitter for Python and TS/JS. Extracts symbols (with ranges + docs), import/export edges, and best-effort call edges. Adds a file watcher for automatic reindexing. Wires the MCP server to the real indexer and returns summary counts. Adds fixtures and tests for extraction, determinism, and MCP integration.
+
+**How to test:**
+
+1. `bun install && bun run build`
+2. `bun run test`
+3. (Optional) `node packages/repo-mcp/dist/bin/repo-mcp.js`, then send:
+
+   ```json
+   {"id":1,"method":"repo.graphBuild","params":{"root":"fixtures/py-mini"}}
+   ```
+
+---
+
+Say the word and I’ll queue up **PR 2** (Skeletonizer) with equally precise file diffs and tests.
+

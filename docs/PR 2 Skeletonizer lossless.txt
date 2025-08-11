@@ -1,0 +1,517 @@
+
+# PR 2 — Skeletonizer (lossless interfaces, elided bodies)
+
+## Objectives
+
+* Produce a compact **skeleton** for any file:
+
+  * Keep: module docstring, imports, public class/func signatures, docstrings/JSDoc, constants/types.
+  * Replace bodies with markers containing **line ranges**, **elided line count**, and **sha1** of elided content.
+* Provide a simple API: `skeletonizeFile(root, path): Skeleton`.
+* Deterministic output; hashes update on body changes.
+* Ready for PR 3 to use inside context-packs.
+
+---
+
+## New/changed files
+
+### `packages/shared/src/types.ts` (add skeleton types)
+
+```ts
+// ...existing exports...
+
+export interface Elision {
+  kind: "func" | "method" | "class" | "module" | "block";
+  name?: string;
+  startLine: number;  // inclusive
+  endLine: number;    // inclusive
+  linesElided: number;
+  sha1: string;
+}
+
+export interface Skeleton {
+  path: FilePath;
+  lang: Lang;
+  text: string;         // human-readable skeleton
+  elisions: Elision[];  // metadata for each elided body
+}
+```
+
+### `packages/repo-index/src/skeleton.ts` (new)
+
+```ts
+import { readFileSync } from "fs";
+import crypto from "crypto";
+import type { Elision, Skeleton } from "@opencode/shared/src/types";
+import type { Lang } from "./types";
+import { skeletonizePython } from "./skeleton/python";
+import { skeletonizeTS } from "./skeleton/ts";
+import { skeletonizeJS } from "./skeleton/js";
+
+export function skeletonizeFile(root: string, path: string): Skeleton {
+  const src = readFileSync(path, "utf8"); // for hash slices
+  const lang = langOf(path);
+  if (!lang) throw new Error(`Unsupported file type: ${path}`);
+
+  if (lang === "python") return skeletonizePython(root, path, src);
+  if (lang === "typescript") return skeletonizeTS(root, path, src);
+  return skeletonizeJS(root, path, src);
+}
+
+export function sha1(text: string): string {
+  return crypto.createHash("sha1").update(text).digest("hex");
+}
+
+// keep in sync with index.ts
+function langOf(p: string): Lang | undefined {
+  if (/\.(py)$/.test(p)) return "python";
+  if (/\.(ts|tsx)$/.test(p)) return "typescript";
+  if (/\.(js|jsx|mjs|cjs)$/.test(p)) return "javascript";
+  return undefined;
+}
+```
+
+### `packages/repo-index/src/skeleton/python.ts` (new)
+
+```ts
+import Parser from "node-tree-sitter";
+import Python from "tree-sitter-python";
+import { Skeleton, Elision } from "@opencode/shared/src/types";
+import { sha1 } from "../skeleton";
+import { relative } from "path";
+
+const parser = new Parser();
+parser.setLanguage(Python as any);
+
+export function skeletonizePython(root: string, file: string, src: string): Skeleton {
+  const tree = parser.parse(src);
+  const elisions: Elision[] = [];
+  const out: string[] = [];
+
+  const rel = relative(root, file).replace(/\\/g, "/");
+  const lines = src.split(/\r?\n/);
+
+  // helpers
+  const L = (n: number) => n + 1;
+  const sliceLines = (a: number, b: number) => lines.slice(a, b + 1).join("\n");
+
+  function pushElision(kind: Elision["kind"], name: string | undefined, start: number, end: number) {
+    const text = sliceLines(start, end);
+    const e = { kind, name, startLine: L(start), endLine: L(end), linesElided: end - start + 1, sha1: sha1(text) };
+    elisions.push(e);
+    return e;
+  }
+
+  // Capture module docstring (first statement if string)
+  const rootNode = tree.rootNode;
+  const firstStmt = rootNode.namedChildren?.[0];
+  let moduleDocUsed = false;
+  if (firstStmt?.type === "expression_statement") {
+    const s = firstStmt.namedChildren?.[0];
+    if (s && (s.type === "string" || s.type === "string_literal")) {
+      out.push(src.slice(s.startIndex, s.endIndex));
+      moduleDocUsed = true;
+    }
+  }
+
+  // Collect imports (preserve original lines)
+  rootNode.namedChildren?.forEach((n: any) => {
+    if (n.type === "import_statement" || n.type === "import_from_statement") {
+      out.push(lines[n.startPosition.row]);
+    }
+  });
+  if (out.length) out.push(""); // spacer
+
+  // Walk defs
+  function emitDef(node: any, indent: string, classCtx?: string) {
+    if (node.type === "function_definition") {
+      const name = node.childForFieldName("name")?.text ?? "anonymous";
+      // header: from start to the line with ':'
+      const headerEnd = node.childForFieldName("parameters")?.endPosition?.row ?? node.startPosition.row;
+      const header = sliceLines(node.startPosition.row, headerEnd) + "\n" + indent + "    ";
+      out.push(indent + sliceLines(node.startPosition.row, headerEnd));
+      // docstring?
+      const body = node.childForFieldName("body");
+      let consumedDoc = false;
+      if (body?.namedChildren?.length) {
+        const first = body.namedChildren[0];
+        const lit = first?.namedChildren?.[0];
+        if (first?.type === "expression_statement" && lit && (lit.type === "string" || lit.type === "string_literal")) {
+          out.push(indent + "    " + src.slice(lit.startIndex, lit.endIndex));
+          consumedDoc = true;
+        }
+      }
+      // elide rest of body
+      const startRow = consumedDoc
+        ? (body.namedChildren?.[0]?.endPosition?.row ?? body.startPosition.row) + 1
+        : body.startPosition.row;
+      const endRow = node.endPosition.row;
+      if (endRow >= startRow) {
+        const e = pushElision(classCtx ? "method" : "func", classCtx ? `${classCtx}.${name}` : name, startRow, endRow);
+        out.push(indent + `    # ⟪ELIDED L${e.startLine}-${e.endLine}; ${e.linesElided} lines; sha1=${e.sha1}⟫`);
+      }
+      out.push(""); // spacer
+      return;
+    }
+
+    if (node.type === "class_definition") {
+      const name = node.childForFieldName("name")?.text ?? "AnonClass";
+      const headerEnd = node.startPosition.row; // 'class X:' is one line usually; allow multi-line bases
+      out.push(indent + lines[node.startPosition.row]);
+      // class docstring
+      const suite = node.namedChildren?.find((n: any) => n.type === "block" || n.type === "suite") ?? node;
+      const first = suite?.namedChildren?.find((n: any) => n.type === "expression_statement");
+      const lit = first?.namedChildren?.[0];
+      if (lit && (lit.type === "string" || lit.type === "string_literal")) {
+        out.push(indent + "    " + src.slice(lit.startIndex, lit.endIndex));
+      }
+      // methods
+      node.namedChildren?.forEach((ch: any) => {
+        if (ch.type === "function_definition") emitDef(ch, indent + "    ", name);
+      });
+      // elide remainder of class body not covered by method/docstring lines
+      const body = node.childForFieldName("body");
+      if (body) {
+        const e = pushElision("class", name, body.startPosition.row, node.endPosition.row);
+        out.push(indent + `    # ⟪ELIDED L${e.startLine}-${e.endLine}; ${e.linesElided} lines; sha1=${e.sha1}⟫`);
+      }
+      out.push("");
+      return;
+    }
+  }
+
+  rootNode.namedChildren?.forEach((n: any) => {
+    if (n.type === "function_definition" || n.type === "class_definition") emitDef(n, "");
+    if (n.type === "expression_statement" && !moduleDocUsed) {
+      // keep simple top-level constants like X = 1 (optional; no-op here)
+    }
+  });
+
+  const text = [
+    `# File: ${rel}`,
+    ...out
+  ].join("\n").replace(/\n{3,}/g, "\n\n");
+
+  return { path: rel, lang: "python", text, elisions };
+}
+```
+
+### `packages/repo-index/src/skeleton/ts.ts` (new)
+
+```ts
+import Parser from "node-tree-sitter";
+import TypeScript from "tree-sitter-typescript";
+import { Skeleton, Elision } from "@opencode/shared/src/types";
+import { sha1 } from "../skeleton";
+import { relative } from "path";
+
+const parser = new Parser();
+parser.setLanguage(TypeScript.typescript as any);
+
+export function skeletonizeTS(root: string, file: string, src: string): Skeleton {
+  return skeletonizeJSLike(root, file, src, "typescript");
+}
+
+// Shared logic for TS-like
+function skeletonizeJSLike(root: string, file: string, src: string, lang: "typescript"): Skeleton {
+  const tree = parser.parse(src);
+  const elisions: Elision[] = [];
+  const out: string[] = [];
+  const rel = relative(root, file).replace(/\\/g, "/");
+  const lines = src.split(/\r?\n/);
+  const L = (n: number) => n + 1;
+  const sliceLines = (a: number, b: number) => lines.slice(a, b + 1).join("\n");
+
+  // imports/exports (preserve as-is)
+  tree.rootNode.namedChildren?.forEach((n: any) => {
+    if (n.type.includes("import") || n.type.includes("export_statement")) {
+      out.push(sliceLines(n.startPosition.row, n.endPosition.row));
+    }
+  });
+  if (out.length) out.push("");
+
+  function pushElision(kind: Elision["kind"], name: string | undefined, start: number, end: number) {
+    const text = sliceLines(start, end);
+    const e = { kind, name, startLine: L(start), endLine: L(end), linesElided: end - start + 1, sha1: sha1(text) };
+    elisions.push(e);
+    return e;
+  }
+
+  function emitFunc(node: any) {
+    const name = node.childForFieldName("name")?.text ?? "anonymous";
+    // header up to opening '{'
+    const headerEndRow = findHeaderEndRow(node);
+    out.push(sliceLines(node.startPosition.row, headerEndRow) + " {");
+    const e = pushElision("func", name, headerEndRow + 1, node.endPosition.row - 1);
+    out.push(`  /* ⟪ELIDED L${e.startLine}-${e.endLine}; ${e.linesElided} lines; sha1=${e.sha1}⟫ */`);
+    out.push("}");
+    out.push("");
+  }
+
+  function emitClass(node: any) {
+    const name = node.childForFieldName("name")?.text ?? "AnonClass";
+    const headerEndRow = findHeaderEndRow(node);
+    out.push(sliceLines(node.startPosition.row, headerEndRow) + " {");
+    // list method names
+    const methods = node.namedChildren?.filter((c: any) => c.type === "method_definition") ?? [];
+    if (methods.length) {
+      out.push("  // methods:");
+      for (const m of methods) {
+        const n = m.childForFieldName("name")?.text ?? "anonymous";
+        out.push(`  // - ${n}(...)`);
+      }
+    }
+    const e = pushElision("class", name, headerEndRow + 1, node.endPosition.row - 1);
+    out.push(`  /* ⟪ELIDED L${e.startLine}-${e.endLine}; ${e.linesElided} lines; sha1=${e.sha1}⟫ */`);
+    out.push("}");
+    out.push("");
+  }
+
+  function emitTypeLike(node: any) {
+    // keep full line(s), they're cheap
+    out.push(sliceLines(node.startPosition.row, node.endPosition.row));
+    out.push("");
+  }
+
+  function findHeaderEndRow(node: any): number {
+    // naive: find the row of the first '{' token after start
+    const cursor: any = node.walk();
+    let minRow = node.startPosition.row;
+    function visit(n: any) {
+      if (n.type === "{" || n.type === "statement_block") {
+        minRow = Math.max(minRow, n.startPosition.row);
+        return;
+      }
+      n.namedChildren?.forEach(visit);
+    }
+    visit(node);
+    return minRow;
+  }
+
+  tree.rootNode.namedChildren?.forEach((n: any) => {
+    if (n.type === "function_declaration") return emitFunc(n);
+    if (n.type === "class_declaration") return emitClass(n);
+    if (n.type === "interface_declaration" || n.type === "type_alias_declaration" || n.type === "enum_declaration") {
+      return emitTypeLike(n);
+    }
+    // export variable declarations (constants)
+    if (n.type === "lexical_declaration" && /export/.test(n.text)) {
+      return emitTypeLike(n);
+    }
+  });
+
+  const text = [`// File: ${rel}`, ...out].join("\n").replace(/\n{3,}/g, "\n\n");
+  return { path: rel, lang, text, elisions };
+}
+```
+
+### `packages/repo-index/src/skeleton/js.ts` (new)
+
+```ts
+import Parser from "node-tree-sitter";
+import JavaScript from "tree-sitter-javascript";
+import { Skeleton, Elision } from "@opencode/shared/src/types";
+import { sha1 } from "../skeleton";
+import { relative } from "path";
+
+const parser = new Parser();
+parser.setLanguage(JavaScript as any);
+
+export function skeletonizeJS(root: string, file: string, src: string): Skeleton {
+  const tree = parser.parse(src);
+  const elisions: Elision[] = [];
+  const out: string[] = [];
+  const rel = relative(root, file).replace(/\\/g, "/");
+  const lines = src.split(/\r?\n/);
+  const L = (n: number) => n + 1;
+  const sliceLines = (a: number, b: number) => lines.slice(a, b + 1).join("\n");
+
+  function pushElision(kind: Elision["kind"], name: string | undefined, start: number, end: number) {
+    const text = sliceLines(start, end);
+    const e = { kind, name, startLine: L(start), endLine: L(end), linesElided: end - start + 1, sha1: sha1(text) };
+    elisions.push(e);
+    return e;
+  }
+
+  // imports/exports
+  tree.rootNode.namedChildren?.forEach((n: any) => {
+    if (n.type.includes("import") || n.type.includes("export_statement")) {
+      out.push(sliceLines(n.startPosition.row, n.endPosition.row));
+    }
+  });
+  if (out.length) out.push("");
+
+  function findHeaderEndRow(node: any): number {
+    let r = node.startPosition.row;
+    node.namedChildren?.forEach((ch: any) => {
+      if (ch.type === "statement_block") r = Math.max(r, ch.startPosition.row);
+    });
+    return r;
+  }
+
+  tree.rootNode.namedChildren?.forEach((n: any) => {
+    if (n.type === "function_declaration") {
+      const name = n.childForFieldName("name")?.text ?? "anonymous";
+      const hdrRow = findHeaderEndRow(n);
+      out.push(sliceLines(n.startPosition.row, hdrRow) + " {");
+      const e = pushElision("func", name, hdrRow + 1, n.endPosition.row - 1);
+      out.push(`  /* ⟪ELIDED L${e.startLine}-${e.endLine}; ${e.linesElided} lines; sha1=${e.sha1}⟫ */\n}`);
+      out.push("");
+    }
+    if (n.type === "class_declaration") {
+      const name = n.childForFieldName("name")?.text ?? "AnonClass";
+      const hdrRow = findHeaderEndRow(n);
+      out.push(sliceLines(n.startPosition.row, hdrRow) + " {");
+      const e = pushElision("class", name, hdrRow + 1, n.endPosition.row - 1);
+      out.push(`  /* ⟪ELIDED L${e.startLine}-${e.endLine}; ${e.linesElided} lines; sha1=${e.sha1}⟫ */\n}`);
+      out.push("");
+    }
+  });
+
+  const text = [`// File: ${rel}`, ...out].join("\n").replace(/\n{3,}/g, "\n\n");
+  return { path: rel, lang: "javascript", text, elisions };
+}
+```
+
+### `packages/repo-index/src/index.ts` (export skeletonizer)
+
+```ts
+// ...existing imports...
+export { skeletonizeFile } from "./skeleton";
+```
+
+---
+
+## Tests
+
+### `tests/skeleton-python.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { resolve } from "path";
+import { skeletonizeFile } from "../packages/repo-index/src/skeleton";
+
+describe("skeletonize python", () => {
+  const root = resolve("fixtures/py-mini");
+  const path = resolve(root, "pkg/mathy.py");
+  const sk = skeletonizeFile(root, path);
+
+  it("emits a readable skeleton", () => {
+    expect(sk.text).toContain("# File: pkg/mathy.py");
+    expect(sk.text).toContain("def add(a, b):");
+    expect(sk.text).toContain("class Accumulator:");
+  });
+
+  it("includes docstrings when present", () => {
+    expect(sk.text).toMatch(/"""Add two numbers.+"""/s);
+  });
+
+  it("adds elision markers with sha1", () => {
+    expect(sk.elisions.length).toBeGreaterThan(0);
+    const e = sk.elisions[0];
+    expect(e.sha1).toMatch(/^[0-9a-f]{40}$/);
+    expect(sk.text).toMatch(/⟪ELIDED L\d+-\d+; \d+ lines; sha1=[0-9a-f]{40}⟫/);
+  });
+});
+```
+
+### `tests/skeleton-ts.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { resolve } from "path";
+import { skeletonizeFile } from "../packages/repo-index/src/skeleton";
+
+describe("skeletonize ts", () => {
+  const root = resolve("fixtures/ts-mini");
+  const path = resolve(root, "src/mathy.ts");
+  const sk = skeletonizeFile(root, path);
+
+  it("keeps function and class headers", () => {
+    expect(sk.text).toContain("export function add(a: number, b: number)");
+    expect(sk.text).toContain("export class Accumulator");
+  });
+
+  it("elides bodies with markers", () => {
+    expect(sk.text).toMatch(/\/\* ⟪ELIDED L\d+-\d+; \d+ lines; sha1=[0-9a-f]{40}⟫ \*\//);
+  });
+
+  it("records elision metadata", () => {
+    expect(sk.elisions.some(e => e.kind === "func")).toBe(true);
+    expect(sk.elisions.some(e => e.kind === "class")).toBe(true);
+  });
+});
+```
+
+### `tests/skeleton-hash-change.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { readFileSync, writeFileSync } from "fs";
+import { resolve } from "path";
+import os from "os";
+import { skeletonizeFile } from "../packages/repo-index/src/skeleton";
+
+describe("skeleton hash updates when body changes", () => {
+  it("changes sha1 if body changes", () => {
+    const root = resolve("fixtures/ts-mini");
+    const srcPath = resolve(root, "src/mathy.ts");
+    const tmp = resolve(os.tmpdir(), "mathy.tmp.ts");
+    writeFileSync(tmp, readFileSync(srcPath, "utf8"));
+    const a = skeletonizeFile(root, tmp);
+    // append a harmless blank line at end of file (inside class body likely unaffected? ensure body change)
+    writeFileSync(tmp, readFileSync(tmp, "utf8").replace("return this.v;", "return this.v;\n"));
+    const b = skeletonizeFile(root, tmp);
+    const aHashes = a.elisions.map(e => e.sha1).join(",");
+    const bHashes = b.elisions.map(e => e.sha1).join(",");
+    expect(aHashes).not.toBe(bHashes);
+  });
+});
+```
+
+### `tests/skeleton-lines.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { resolve } from "path";
+import { skeletonizeFile } from "../packages/repo-index/src/skeleton";
+
+describe("elided line counts make sense", () => {
+  it("has positive elided lines", () => {
+    const root = resolve("fixtures/py-mini");
+    const path = resolve(root, "pkg/mathy.py");
+    const sk = skeletonizeFile(root, path);
+    for (const e of sk.elisions) {
+      expect(e.linesElided).toBeGreaterThanOrEqual(1);
+      expect(e.endLine).toBeGreaterThanOrEqual(e.startLine);
+    }
+  });
+});
+```
+
+---
+
+## Acceptance criteria (PR 2)
+
+* `bun run build` succeeds; `bun run test` passes all new tests.
+* `skeletonizeFile(root, path)` returns:
+
+  * `text` that includes headers/signatures/imports/docstrings (when present)
+  * `elisions` with correct `startLine`, `endLine`, `linesElided`, and `sha1` (40 hex chars)
+* Modifying a body changes the corresponding elision hash in tests.
+* Output is **deterministic** for identical inputs.
+* No changes to MCP API yet (that lands in PR 4).
+
+---
+
+## Notes / guardrails
+
+* **Faithfulness:** We keep NL/docstrings verbatim where captured; no paraphrasing.
+* **Syntactic closure:** TS/JS skeletons keep braces so the structure reads naturally; Python uses comment elision lines (not runnable code; it’s a view).
+* **Token thrift:** Types/interfaces/consts are kept verbatim—they cost little and help understanding. If they get big, we’ll selectively elide in PR 3.
+* **Future PRs:** We’ll add span-reading, context-pack selection, and MCP exposure; the agent will ask for `readSpan` when it needs bodies.
+
+---
+
+If this looks good, I’ll queue **PR 3 — Working-Set Selector (budgeted context packs)** next, with the exact API and tests to prove we stay under budget without dropping needed neighbors.
+
