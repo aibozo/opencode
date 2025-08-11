@@ -57,3 +57,32 @@ export function assemblePrompt(pack: ContextPack, notes: string, plan: string): 
   ].join("\n")
 }
 
+export function renderContextFrame(opts: {
+  pack: ContextPack
+  notes: string
+  recentEdits?: string
+  frameId: string
+  prefixSha256: string
+}): { text: string; sha256: string } {
+  const b: string[] = []
+  b.push(`<CONTEXT_FRAME id=${opts.frameId} prefix_sha=${opts.prefixSha256}>`)
+  b.push("# INSTRUCTIONS")
+  b.push("- Use ONLY this frame for coding decisions.")
+  b.push("- If you need code bodies, call repo.code.readSpan(path,start,end).")
+  b.push("")
+  b.push("# WORKING SET (token-capped)")
+  b.push(renderContextPack(opts.pack))
+  b.push("")
+  b.push("# NOTES (extractive, verbatim)")
+  b.push((opts.notes || "").trim())
+  b.push("")
+  b.push("# RECENT EDITS (last 20)")
+  b.push(((opts.recentEdits || "(no recent edits)") as string).trim())
+  b.push("")
+  b.push("# GUARANTEES")
+  b.push("- All edited lines must be within FULL spans or readSpan results.")
+  b.push("</CONTEXT_FRAME>")
+  const t = b.join("\n")
+  const h = crypto.createHash("sha256").update(t).digest("hex")
+  return { text: t, sha256: h }
+}

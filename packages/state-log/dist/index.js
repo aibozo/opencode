@@ -28,3 +28,6 @@ export function summarize(limit = 10) {
         .map((x) => `- [${x.ts}] why: ${x.why} | what: ${x.what}${x.next ? ` | next: ${x.next}` : ""}`)
         .join("\n");
 }
+export function recentEdits(n = 20) {
+    return summarize(n);
+}

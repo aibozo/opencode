@@ -10,3 +10,4 @@ export interface DecisionState {
 export declare function loadLog(): DecisionState;
 export declare function appendDecision(e: Omit<DecisionEntry, "ts">): void;
 export declare function summarize(limit?: number): string;
+export declare function recentEdits(n?: number): string;

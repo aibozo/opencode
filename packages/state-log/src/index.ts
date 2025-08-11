@@ -39,3 +39,6 @@ export function summarize(limit = 10): string {
     .join("\n")
 }
 
+export function recentEdits(n = 20): string {
+  return summarize(n)
+}

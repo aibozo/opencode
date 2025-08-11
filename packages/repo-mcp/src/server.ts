@@ -11,6 +11,8 @@ import { readExposures, mergeExposures } from "@opencode/metrics/dist/exposure.j
 import { diffHunks } from "@opencode/metrics/dist/git.js"
 import { computeRecall } from "@opencode/metrics/dist/recall.js"
 import { readFileSync } from "fs"
+import { stablePrefixBlock, renderContextFrame } from "@opencode/prompt-kit"
+import { recentEdits } from "@opencode/state-log"
 
 const tools = [
   { name: "repo.graphBuild", description: "Build or refresh the repository index and start a file watcher.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
@@ -105,7 +107,17 @@ export async function startServer() {
           }
           const sessionId = (args as any)?.sessionId || (process.env.SESSION_ID ?? "")
           if (sessionId) logWorkingSet(sessionId as string, root, pack, fileLens)
-          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result: { pack, debug } }) + "\n")
+          const pref = stablePrefixBlock()
+          const fid = crypto.randomUUID()
+          const fr = renderContextFrame({
+            pack,
+            notes: (pack as any)?.notes ?? "",
+            recentEdits: recentEdits(20),
+            frameId: fid,
+            prefixSha256: pref.sha256,
+          })
+          const result = { pack, debug, context_block: fr.text, prefix_block: pref.text, prefix_sha256: pref.sha256, frame_sha256: fr.sha256, frame_id: fid, version: "9.0" }
+          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n")
           console.error("MCP:DOWS:done")
           continue
         }

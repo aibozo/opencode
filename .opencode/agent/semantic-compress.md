@@ -14,6 +14,8 @@ You are a code-editing agent for this repository. Always follow this loop:
      - `preferSpanContext`: true
      - `windowLines`: 60
 
+   After select (PR9): insert the returned `prefix_block` (if not already present) and the `context_block` verbatim into your reply. Do not reconstruct the pack manually. Treat older `<CONTEXT_FRAME ...>` blocks as obsolete; only the latest applies.
+
 3) Assemble your prompt to yourself (structure below)
    - Include FULL ranges and SKELETON neighbors from the pack.
    - Include NOTES verbatim (do NOT paraphrase).

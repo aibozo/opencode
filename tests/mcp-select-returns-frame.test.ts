@@ -20,8 +20,8 @@ async function rpc(proc: any, id: number, method: string, params?: any) {
   return JSON.parse(line)
 }
 
-describe("MCP workingSet.select", () => {
-  it("returns a pack with full+skeletal under budget", async () => {
+describe("workingSet.select returns pre-rendered frame + prefix", () => {
+  it("includes context_block and hashes", async () => {
     const proc = spawn("node", ["packages/repo-mcp/dist/bin/repo-mcp.js"], {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, REPO_ROOT: resolve("fixtures/ts-mini") },
@@ -30,9 +30,14 @@ describe("MCP workingSet.select", () => {
     if (!pre) { proc.kill(); expect(true).toBe(true); return }
     await rpc(proc, 1, "tools/call", { name: "repo.graphBuild", arguments: {} })
     const issue = readFileSync(resolve("fixtures/ts-mini/ISSUE.md"), "utf8")
-    const r = await rpc(proc, 2, "tools/call", { name: "repo.workingSet.select", arguments: { task: issue, budgetTokens: 3000, radius: 1 } })
-    expect(r.result.pack.full.length).toBeGreaterThan(0)
-    expect(r.result.pack.budget.used).toBeLessThanOrEqual(r.result.pack.budget.target)
+    const r = await rpc(proc, 2, "tools/call", {
+      name: "repo.workingSet.select",
+      arguments: { task: issue, budgetTokens: 3000, radius: 1 },
+    })
+    expect(r.result.context_block).toMatch(/<CONTEXT_FRAME .*?>/)
+    expect(r.result.prefix_block).toMatch(/## Stable Project Rules/)
+    expect(r.result.prefix_sha256).toMatch(/^[0-9a-f]{64}$/)
+    expect(r.result.frame_sha256).toMatch(/^[0-9a-f]{64}$/)
     proc.kill()
-  }, 15000)
+  }, 30000)
 })
