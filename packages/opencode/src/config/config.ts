@@ -175,6 +175,7 @@ export namespace Config {
       description: z.string().optional().describe("Description of when to use the agent"),
       mode: z.union([z.literal("subagent"), z.literal("primary"), z.literal("all")]).optional(),
     })
+    .catchall(z.any())
     .openapi({
       ref: "AgentConfig",
     })
@@ -341,6 +342,7 @@ export namespace Config {
         .object({
           edit: Permission.optional(),
           bash: z.union([Permission, z.record(z.string(), Permission)]).optional(),
+          webfetch: Permission.optional(),
         })
         .optional(),
       experimental: z

@@ -183,6 +183,9 @@ export type Part =
       type: "text"
     } & TextPart)
   | ({
+      type: "reasoning"
+    } & ReasoningPart)
+  | ({
       type: "file"
     } & FilePart)
   | ({
@@ -212,6 +215,21 @@ export type TextPart = {
   text: string
   synthetic?: boolean
   time?: {
+    start: number
+    end?: number
+  }
+}
+
+export type ReasoningPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: string
+  text: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
     start: number
     end?: number
   }
@@ -691,6 +709,7 @@ export type Config = {
       | {
           [key: string]: string
         }
+    webfetch?: string
   }
   experimental?: {
     hook?: {
@@ -889,6 +908,16 @@ export type AgentConfig = {
    */
   description?: string
   mode?: string
+  [key: string]:
+    | unknown
+    | string
+    | number
+    | {
+        [key: string]: boolean
+      }
+    | boolean
+    | string
+    | undefined
 }
 
 export type Provider = {
@@ -1035,6 +1064,9 @@ export type Agent = {
   prompt?: string
   tools: {
     [key: string]: boolean
+  }
+  options: {
+    [key: string]: unknown
   }
 }
 

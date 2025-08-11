@@ -22,6 +22,7 @@ export namespace Agent {
         .optional(),
       prompt: z.string().optional(),
       tools: z.record(z.boolean()),
+      options: z.record(z.string(), z.any()),
     })
     .openapi({
       ref: "Agent",
@@ -39,15 +40,18 @@ export namespace Agent {
           todoread: false,
           todowrite: false,
         },
+        options: {},
         mode: "subagent",
       },
       build: {
         name: "build",
         tools: {},
+        options: {},
         mode: "primary",
       },
       plan: {
         name: "plan",
+        options: {},
         tools: {
           write: false,
           edit: false,
@@ -66,8 +70,14 @@ export namespace Agent {
         item = result[key] = {
           name: key,
           mode: "all",
+          options: {},
           tools: {},
         }
+      const { model, prompt, tools, description, temperature, top_p, mode, ...extra } = value
+      item.options = {
+        ...item.options,
+        ...extra,
+      }
       if (value.model) item.model = Provider.parseModel(value.model)
       if (value.prompt) item.prompt = value.prompt
       if (value.tools)
