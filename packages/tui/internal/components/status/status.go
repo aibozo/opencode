@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+    "fmt"
 
 	tea "github.com/charmbracelet/bubbletea/v2"
 	"github.com/charmbracelet/lipgloss/v2"
@@ -178,6 +179,26 @@ func (m *statusComponent) View() string {
 		Render(cwdDisplay)
 
 	background := t.BackgroundPanel()
+
+	// Compression indicator
+	compressLabel := "CMP OFF"
+	compressStyle := styles.NewStyle().
+		Foreground(t.TextMuted()).
+		Background(t.BackgroundPanel()).
+		Padding(0, 1)
+	if m.app.State.CompressionEnabled {
+		budget := m.app.State.CompressionBudget
+		if budget <= 0 {
+			budget = 3000
+		}
+		compressLabel = "CMP " + fmt.Sprint(budget)
+		compressStyle = styles.NewStyle().
+			Foreground(t.Success()).
+			Background(t.BackgroundPanel()).
+			Padding(0, 1)
+	}
+	compress := compressStyle.Render(compressLabel)
+
 	status := layout.Render(
 		layout.FlexOptions{
 			Background: &background,
@@ -190,7 +211,7 @@ func (m *statusComponent) View() string {
 			View: logo + cwd,
 		},
 		layout.FlexItem{
-			View: agent,
+			View: compress + agent,
 		},
 	)
 
