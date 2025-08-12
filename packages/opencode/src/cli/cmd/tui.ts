@@ -107,7 +107,8 @@ export const TuiCommand = cmd({
         let cmd = ["go", "run", "./main.go"]
         let cwd = Bun.fileURLToPath(new URL("../../../../tui/cmd/opencode", import.meta.url))
         const tui = Bun.embeddedFiles.find((item) => (item as File).name.includes("tui")) as File
-        if (tui) {
+        const preferLocal = process.env["OPENCODE_USE_LOCAL_TUI"] === "1"
+        if (tui && !preferLocal) {
           let binaryName = tui.name
           if (process.platform === "win32" && !binaryName.endsWith(".exe")) {
             binaryName += ".exe"
@@ -123,6 +124,7 @@ export const TuiCommand = cmd({
         }
         Log.Default.info("tui", {
           cmd,
+          preferLocal,
         })
         const proc = Bun.spawn({
           cmd: [
