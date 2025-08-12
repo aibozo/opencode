@@ -382,9 +382,6 @@ func (a Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.app.Messages = []app.Message{}
 	case dialog.CompletionDialogCloseMsg:
 		a.showCompletionDialog = false
-	case chat.AttachmentInsertedMsg:
-		// Close completion dialog when the editor inserts an attachment
-		a.showCompletionDialog = false
 	case opencode.EventListResponseEventInstallationUpdated:
 		return a, toast.NewSuccessToast(
 			"opencode updated to "+msg.Properties.Version+", restart to apply.",
@@ -598,6 +595,32 @@ func (a Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ModelID:    msg.Model.ID,
 		}
 		a.app.State.UpdateModelUsage(msg.Provider.ID, msg.Model.ID)
+		cmds = append(cmds, a.app.SaveState())
+	case app.AgentSelectedMsg:
+		// Find the agent index
+		for i, agent := range a.app.Agents {
+			if agent.Name == msg.Agent.Name {
+				a.app.AgentIndex = i
+				break
+			}
+		}
+		a.app.State.Agent = msg.Agent.Name
+
+		// Switch to the agent's preferred model if available
+		if model, ok := a.app.State.AgentModel[msg.Agent.Name]; ok {
+			for _, provider := range a.app.Providers {
+				if provider.ID == model.ProviderID {
+					a.app.Provider = &provider
+					for _, m := range provider.Models {
+						if m.ID == model.ModelID {
+							a.app.Model = &m
+							break
+						}
+					}
+					break
+				}
+			}
+		}
 		cmds = append(cmds, a.app.SaveState())
 	case dialog.ThemeSelectedMsg:
 		a.app.State.Theme = msg.ThemeName
@@ -1116,9 +1139,24 @@ func (a Model) executeCommand(command commands.Command) (tea.Model, tea.Cmd) {
 		}
 		cmds = append(cmds, util.CmdHandler(chat.ToggleToolDetailsMsg{}))
 		cmds = append(cmds, toast.NewInfoToast(message))
+	case commands.ThinkingBlocksCommand:
+		message := "Thinking blocks are now visible"
+		if a.messages.ThinkingBlocksVisible() {
+			message = "Thinking blocks are now hidden"
+		}
+		cmds = append(cmds, util.CmdHandler(chat.ToggleThinkingBlocksMsg{}))
+		cmds = append(cmds, toast.NewInfoToast(message))
 	case commands.ModelListCommand:
 		modelDialog := dialog.NewModelDialog(a.app)
 		a.modal = modelDialog
+	case commands.AgentListCommand:
+		agentDialog := dialog.NewAgentDialog(a.app)
+		a.modal = agentDialog
+	case commands.ModelCycleRecentCommand:
+		slog.Debug("ModelCycleRecentCommand triggered")
+		updated, cmd := a.app.CycleRecentModel()
+		a.app = updated
+		cmds = append(cmds, cmd)
 	case commands.ThemeListCommand:
 		themeDialog := dialog.NewThemeDialog()
 		a.modal = themeDialog

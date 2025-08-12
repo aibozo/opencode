@@ -15,6 +15,7 @@ import {
 } from "ai"
 
 import PROMPT_INITIALIZE from "../session/prompt/initialize.txt"
+import PROMPT_PLAN from "../session/prompt/plan.txt"
 
 import { App } from "../app/app"
 import { Bus } from "../bus"
@@ -41,6 +42,7 @@ import { ToolRegistry } from "../tool/registry"
 import { Plugin } from "../plugin"
 import { Agent } from "../agent/agent"
 import { Permission } from "../permission"
+import { Wildcard } from "../util/wildcard"
 
 export namespace Session {
   const log = Log.create({ service: "session" })
@@ -607,17 +609,6 @@ export namespace Session {
         ]
       }),
     ).then((x) => x.flat())
-    /*
-    if (inputAgent === "plan")
-      userParts.push({
-        id: Identifier.ascending("part"),
-        messageID: userMsg.id,
-        sessionID: input.sessionID,
-        type: "text",
-        text: PROMPT_PLAN,
-        synthetic: true,
-      })
-      */
     await Plugin.trigger(
       "chat.message",
       {},
@@ -720,6 +711,16 @@ export namespace Session {
     }
 
     const agent = await Agent.get(inputAgent)
+    if (agent.name === "plan") {
+      msgs.at(-1)?.parts.push({
+        id: Identifier.ascending("part"),
+        messageID: userMsg.id,
+        sessionID: input.sessionID,
+        type: "text",
+        text: PROMPT_PLAN,
+        synthetic: true,
+      })
+    }
     let system = SystemPrompt.header(input.providerID)
     system.push(
       ...(() => {
@@ -768,7 +769,7 @@ export namespace Session {
       mergeDeep(input.tools ?? {}),
     )
     for (const item of await ToolRegistry.tools(input.providerID, input.modelID)) {
-      if (enabledTools[item.id] === false) continue
+      if (Wildcard.all(item.id, enabledTools) === false) continue
       tools[item.id] = tool({
         id: item.id as any,
         description: item.description,
@@ -829,7 +830,7 @@ export namespace Session {
     }
 
     for (const [key, item] of Object.entries(await MCP.tools())) {
-      if (enabledTools[key] === false) continue
+      if (Wildcard.all(key, enabledTools) === false) continue
       const execute = item.execute
       if (!execute) continue
       item.execute = async (args, opts) => {
@@ -1007,7 +1008,7 @@ export namespace Session {
       async process(stream: StreamTextResult<Record<string, AITool>, never>) {
         try {
           let currentText: MessageV2.TextPart | undefined
-          // let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
+          let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
 
           for await (const value of stream.fullStream) {
             log.info("part", {
@@ -1017,7 +1018,6 @@ export namespace Session {
               case "start":
                 break
 
-              /*
               case "reasoning-start":
                 if (value.id in reasoningMap) {
                   continue
@@ -1055,7 +1055,6 @@ export namespace Session {
                   delete reasoningMap[value.id]
                 }
                 break
-                */
 
               case "tool-input-start":
                 const part = await updatePart({

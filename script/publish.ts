@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
-import path from "path"
 
 console.log("=== publishing ===\n")
 
@@ -45,7 +44,9 @@ process.chdir(dir)
 if (!snapshot) {
   await $`git commit -am "release: v${version}"`
   await $`git tag v${version}`
-  await $`git push origin HEAD --tags --no-verify`
+  await $`git fetch origin`
+  await $`git cherry-pick HEAD..origin/dev`.nothrow()
+  await $`git push origin HEAD --tags --no-verify --force`
 
   const previous = await fetch("https://api.github.com/repos/sst/opencode/releases/latest")
     .then((res) => {

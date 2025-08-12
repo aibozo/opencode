@@ -22,30 +22,32 @@ type AgentModel struct {
 }
 
 type State struct {
-    Theme              string                `toml:"theme"`
-    ScrollSpeed        *int                  `toml:"scroll_speed"`
-    AgentModel         map[string]AgentModel `toml:"agent_model"`
-    Provider           string                `toml:"provider"`
-    Model              string                `toml:"model"`
-    Agent              string                `toml:"agent"`
-    RecentlyUsedModels []ModelUsage          `toml:"recently_used_models"`
-    MessagesRight      bool                  `toml:"messages_right"`
-    SplitDiff          bool                  `toml:"split_diff"`
-    MessageHistory     []Prompt              `toml:"message_history"`
-    CompressionEnabled bool                  `toml:"compression_enabled"`
-    CompressionBudget  int                   `toml:"compression_budget"`
+	Theme              string                `toml:"theme"`
+	ScrollSpeed        *int                  `toml:"scroll_speed"`
+	AgentModel         map[string]AgentModel `toml:"agent_model"`
+	Provider           string                `toml:"provider"`
+	Model              string                `toml:"model"`
+	Agent              string                `toml:"agent"`
+	RecentlyUsedModels []ModelUsage          `toml:"recently_used_models"`
+	MessagesRight      bool                  `toml:"messages_right"`
+	SplitDiff          bool                  `toml:"split_diff"`
+	MessageHistory     []Prompt              `toml:"message_history"`
+	ShowToolDetails    *bool                 `toml:"show_tool_details"`
+	ShowThinkingBlocks *bool                 `toml:"show_thinking_blocks"`
+	CompressionEnabled bool                  `toml:"compression_enabled"`
+	CompressionBudget  int                   `toml:"compression_budget"`
 }
 
 func NewState() *State {
-    return &State{
-        Theme:              "opencode",
-        Agent:              "build",
-        AgentModel:         make(map[string]AgentModel),
-        RecentlyUsedModels: make([]ModelUsage, 0),
-        MessageHistory:     make([]Prompt, 0),
-        CompressionEnabled: false,
-        CompressionBudget:  3000,
-    }
+	return &State{
+		Theme:              "opencode",
+		Agent:              "build",
+		AgentModel:         make(map[string]AgentModel),
+		RecentlyUsedModels: make([]ModelUsage, 0),
+		MessageHistory:     make([]Prompt, 0),
+		CompressionEnabled: false,
+		CompressionBudget:  3000,
+	}
 }
 
 // UpdateModelUsage updates the recently used models list with the specified model
