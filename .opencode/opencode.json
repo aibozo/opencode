@@ -6,7 +6,7 @@
     "docs/dev-standards.md"
   ],
   "keybinds": {
-    "compression_toggle": "<leader>b,ctrl+shift+b"
+    "compression_toggle": "<leader>k,ctrl+shift+b"
   },
   "agents": {
     "semantic-compress": {

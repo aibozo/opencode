@@ -388,7 +388,7 @@ func LoadFromConfig(config *opencode.Config) CommandRegistry {
         {
             Name:        CompressionToggleCommand,
             Description: "toggle compression",
-            Keybindings: parseBindings("<leader>b", "ctrl+shift+b"),
+            Keybindings: parseBindings("<leader>k", "ctrl+shift+b"),
             Trigger:     []string{"compress"},
         },
         {
