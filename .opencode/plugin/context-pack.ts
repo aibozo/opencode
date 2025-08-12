@@ -4,12 +4,13 @@ import { stablePrefixBlock } from "../../packages/prompt-kit/src/index"
 const SENSITIVE = /\.(env|aws|ssh|git)(\.|\/|$)/i
 const FRAME_RE = /<CONTEXT_FRAME[^>]*>[\s\S]*?<\/CONTEXT_FRAME>/g
 
-export function onPreSendPrompt(text: string) {
+export function onPreSendPrompt(input: unknown) {
+  const text = typeof input === "string" ? input : String(input ?? "")
   const p = stablePrefixBlock()
   const has = text.includes("## Stable Project Rules") && text.includes("## Coding Standards")
   const base = has ? text : `${p.text}\n\n${text}`
   const frames = base.match(FRAME_RE) ?? []
-  const last = frames.at(-1) ?? ""
+  const last = frames.length ? frames[frames.length - 1] : ""
   const stripped = base.replace(FRAME_RE, "").trim()
   const joined = last ? `${last}\n\n${stripped}` : stripped
   const frame = FRAME_RE.test(joined)

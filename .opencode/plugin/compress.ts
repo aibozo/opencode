@@ -9,7 +9,7 @@ export const compress: Plugin = async () => ({
     for (let x = 0; x < output.parts.length; x++) {
       const p = output.parts[x]
       if (p.type !== "text") continue
-      if (!p.text) continue
+      if (!p.text || typeof p.text !== "string") continue
       if (!RE.test(p.text)) continue
       i = x
       break
@@ -29,4 +29,3 @@ export const compress: Plugin = async () => ({
     output.parts[i] = { ...part, text: txt }
   },
 })
-
