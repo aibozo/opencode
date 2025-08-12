@@ -657,16 +657,22 @@ func (a *App) SendPrompt(ctx context.Context, prompt Prompt) (*App, tea.Cmd) {
     }
 
     messageID := id.Ascending(id.Message)
-    p := prompt
+    message := prompt.ToMessage(messageID, a.Session.ID)
     if a.State.CompressionEnabled {
         budget := a.State.CompressionBudget
         if budget <= 0 {
             budget = 3000
         }
         prefix := fmt.Sprintf("<!-- compress:on budget=%d -->\n", budget)
-        p.Text = prefix + p.Text
+        // Prepend marker to the final text part to avoid breaking attachment indices
+        for i, part := range message.Parts {
+            if p, ok := part.(opencode.TextPart); ok {
+                p.Text = prefix + p.Text
+                message.Parts[i] = p
+                break
+            }
+        }
     }
-    message := p.ToMessage(messageID, a.Session.ID)
 
 	a.Messages = append(a.Messages, message)
 
