@@ -28,59 +28,60 @@ export namespace Plugin {
       await Bun.write(file, content)
       log.info("scaffolded plugin", { path: file })
     }
-    const contextPack = `import type { Plugin } from "@opencode-ai/plugin"
-import { readFileSync } from "node:fs"
-import crypto from "node:crypto"
-
-const SENSITIVE = /\\.(env|aws|ssh|git)(\\.|\\/|$)/i
-const FRAME_RE = /<CONTEXT_FRAME[^>]*>[\\s\\S]*?<\\/CONTEXT_FRAME>/g
-
-function stablePrefixBlock() {
-  let a = ""
-  let b = ""
-  try { a = readFileSync("AGENTS.md", "utf8") } catch {}
-  try { b = readFileSync("docs/dev-standards.md", "utf8") } catch {}
-  const t = [
-    "## Stable Project Rules",
-    a.trim(),
-    "",
-    "## Coding Standards",
-    b.trim(),
-  ].join("\\n")
-  const h = crypto.createHash("sha256").update(t).digest("hex")
-  return { text: t, sha256: h }
-}
-
-export function onPreSendPrompt(text: string) {
-  const p = stablePrefixBlock()
-  const has = text.includes("## Stable Project Rules") && text.includes("## Coding Standards")
-  const base = has ? text : `${p.text}\\n\\n${text}`
-  const frames = base.match(FRAME_RE) ?? []
-  const last = frames.at(-1) ?? ""
-  const stripped = base.replace(FRAME_RE, "").trim()
-  const joined = last ? `${last}\\n\\n${stripped}` : stripped
-  const frame = FRAME_RE.test(joined)
-    ? joined
-    : `<!-- WARNING: no CONTEXT_FRAME detected; call repo.workingSet.select and include context_block -->\\n${joined}`
-  const hint = /\\[FULL\\]/.test(frame) && !/tests?\\//i.test(frame)
-    ? `<!-- Hint: prefer readSpan for non-test files -->\\n${frame}`
-    : frame
-  const warn = SENSITIVE.test(hint)
-    ? `<!-- WARNING: sensitive filename detected; remove from prompt -->\\n${hint}`
-    : hint
-  return `<!-- prefix_sha256=${p.sha256} -->\\n${warn}`
-}
-
-export const contextPack: Plugin = async () => ({
-  async "chat.message"(_input, output) {
-    output.parts = output.parts.map((part) => {
-      if (part.type !== "text") return part
-      if (!part.text) return part
-      return { ...part, text: onPreSendPrompt(part.text) }
-    })
-  },
-})
-`
+    const contextPack = [
+      'import type { Plugin } from "@opencode-ai/plugin"',
+      'import { readFileSync } from "node:fs"',
+      'import crypto from "node:crypto"',
+      '',
+      'const SENSITIVE = /\\.(env|aws|ssh|git)(\\.|\\/|$)/i',
+      'const FRAME_RE = /<CONTEXT_FRAME[^>]*>[\\s\\S]*?<\\/CONTEXT_FRAME>/g',
+      '',
+      'function stablePrefixBlock() {',
+      '  let a = ""',
+      '  let b = ""',
+      '  try { a = readFileSync("AGENTS.md", "utf8") } catch {}',
+      '  try { b = readFileSync("docs/dev-standards.md", "utf8") } catch {}',
+      '  const t = [',
+      '    "## Stable Project Rules",',
+      '    a.trim(),',
+      '    "",',
+      '    "## Coding Standards",',
+      '    b.trim(),',
+      '  ].join("\\n")',
+      '  const h = crypto.createHash("sha256").update(t).digest("hex")',
+      '  return { text: t, sha256: h }',
+      '}',
+      '',
+      'export function onPreSendPrompt(text: string) {',
+      '  const p = stablePrefixBlock()',
+      '  const has = text.includes("## Stable Project Rules") && text.includes("## Coding Standards")',
+      '  const base = has ? text : `${p.text}\\n\\n${text}`',
+      '  const frames = base.match(FRAME_RE) ?? []',
+      '  const last = frames.length ? frames[frames.length - 1] : ""',
+      '  const stripped = base.replace(FRAME_RE, "").trim()',
+      '  const joined = last ? `${last}\\n\\n${stripped}` : stripped',
+      '  const frame = FRAME_RE.test(joined)',
+      '    ? joined',
+      '    : `<!-- WARNING: no CONTEXT_FRAME detected; call repo.workingSet.select and include context_block -->\\n${joined}`',
+      '  const hint = /\\[FULL\\]/.test(frame) && !/tests?\\//i.test(frame)',
+      '    ? `<!-- Hint: prefer readSpan for non-test files -->\\n${frame}`',
+      '    : frame',
+      '  const warn = SENSITIVE.test(hint)',
+      '    ? `<!-- WARNING: sensitive filename detected; remove from prompt -->\\n${hint}`',
+      '    : hint',
+      '  return `<!-- prefix_sha256=${p.sha256} -->\\n${warn}`',
+      '}',
+      '',
+      'export const contextPack: Plugin = async () => ({',
+      '  async "chat.message"(_input, output) {',
+      '    output.parts = output.parts.map((part) => {',
+      '      if (part.type !== "text") return part',
+      '      if (!part.text) return part',
+      '      return { ...part, text: onPreSendPrompt(part.text) }',
+      '    })',
+      '  },',
+      '})',
+    ].join("\n")
     const compress = `import type { Plugin } from "@opencode-ai/plugin"
 import { compress as nlCompress } from "@opencode/nl-compress/dist/index.js"
 
